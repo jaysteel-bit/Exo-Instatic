@@ -509,6 +509,28 @@ body {
     background: var(--scrollbar-track);
 }
 
+/*
+ * Flow OS presence pointer — CSS-only port for this admin document.
+ * Default arrow only. Do not set cursor:none and do not JS-follow the mouse.
+ * Module CSS (grab / ew-resize / pointer) and Tiptap/ProseMirror keep native
+ * text caret and resize handles. Hotspot 5 4 matches presence-cursor-system.md.
+ * PNG is the 28×28 path composited into 32×32 (no scale) so Chromium accepts it.
+ */
+@media (pointer: fine) {
+    html,
+    body {
+        cursor: url("/cursors/flow-pointer.png") 5 4, auto;
+    }
+
+    input:not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]),
+    textarea,
+    [contenteditable="true"],
+    .ProseMirror,
+    .tiptap {
+        cursor: text;
+    }
+}
+
 /* ===========================================================================
  * Global skeleton shimmer keyframes.
  *

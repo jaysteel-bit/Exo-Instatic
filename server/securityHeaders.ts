@@ -62,14 +62,22 @@ export function applySecurityHeaders(res: Response, pathname: string): Response 
   }
 
   // ── Admin-specific — prevent clickjacking ────────────────────────────────
-  // Both the admin HTML shell and admin API responses must not be frameable.
-  // A framed CMS admin is a clickjacking vector for one-click publish/delete.
+  // Both the admin HTML shell and admin API responses must not be frameable
+  // unless Flow OS embeds this engine (LAUNCH_CMS_FRAME_ANCESTORS).
   if (pathname.startsWith('/admin')) {
-    headers.set('x-frame-options', 'DENY')
-    headers.set(
-      'content-security-policy',
-      "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
-    )
+    const embedAncestors = process.env.LAUNCH_CMS_FRAME_ANCESTORS?.trim()
+    if (embedAncestors) {
+      headers.set(
+        'content-security-policy',
+        `frame-ancestors ${embedAncestors} 'self'; base-uri 'self'; object-src 'none'`,
+      )
+    } else {
+      headers.set('x-frame-options', 'DENY')
+      headers.set(
+        'content-security-policy',
+        "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+      )
+    }
   }
 
   return new Response(res.body, {

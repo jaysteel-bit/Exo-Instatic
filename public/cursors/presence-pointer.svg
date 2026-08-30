@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+  <!-- CSS-cursor source. Exact Presence Cursor path. No drop-shadow filter (Chromium 32px cursor limit). Fill baked to local black. -->
+  <path
+    d="M5.08814 5.36283L10.4791 20.7254C10.781 21.5857 11.9824 21.6263 12.3417 20.7884L15.0192 14.5442C15.1203 14.3083 15.3083 14.1203 15.5442 14.0192L21.7884 11.3417C22.6263 10.9824 22.5857 9.78096 21.7254 9.47907L6.36285 4.08812C5.57154 3.81044 4.81046 4.57152 5.08814 5.36283Z"
+    fill="#000000"
+    stroke="#ffffff"
+    stroke-width="2.05556"
+    stroke-linejoin="round"
+  />
+</svg>

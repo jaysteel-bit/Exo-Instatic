@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid'
 import type { DbClient } from '../db/client'
+import { emitBrandDiffFromAudit } from '../flowOsDiffs'
 import { Type, type Static } from '@core/utils/typeboxHelpers'
 import { compiledCheck, compiledDecode } from '@core/utils/typeboxCompiler'
 
@@ -204,6 +205,7 @@ export async function createAuditEvent(
       ${input.userAgent ?? null}
     )
   `
+  emitBrandDiffFromAudit(input)
 }
 
 export async function listAuditEvents(db: DbClient, limit = 100): Promise<AuditEvent[]> {
