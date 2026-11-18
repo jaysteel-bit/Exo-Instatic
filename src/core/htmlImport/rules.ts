@@ -9,17 +9,18 @@
  *   base.text    — `text` (string), `tag` (TextTag)
  *   base.link    — `text` (string), `href`, `target`   (NOT `label`)
  *   base.button  — `label` (string), `href`, `target`, `disabled`
- *   base.image   — `src` only (alt comes from media library, not a prop)
+ *   base.image   — `src` + `loading` / `decoding` / `fetchPriority` (alt is reported to the media record, not a prop)
  *   base.container — `tag` (builtin name | 'custom'), `customTag` (free text)
  *   base.form + form controls — semantic form primitives.
  *
- * BUILTIN_HTML_TAGS in base.container: div, section, article, main, header,
- * footer, nav, aside, ul, ol. Tags outside that set MUST use tag:'custom' +
- * customTag so resolveHtmlTag emits the real element name.
+ * BUILTIN_HTML_TAGS (`@core/htmlAttributes`): div, section, article, main,
+ * header, footer, nav, aside, ul, ol. Tags outside that set MUST use
+ * tag:'custom' + customTag so resolveHtmlTag emits the real element name.
  */
 
 import { normalizeImportedText } from './text'
 import { normalizeIdentifierValue } from '@core/utils/identifier'
+import { normalizeAnchorTarget } from '@core/htmlAttributes'
 
 export interface ImportRule {
   /** CSS selector tested via `el.matches()`. */
@@ -28,7 +29,7 @@ export interface ImportRule {
   map: (el: Element) => { moduleId: string; props: Record<string, unknown> }
   /**
    * When truthy the walker recurses into the element's children and sets
-   * `node.children` to their IDs. Leaf modules (text, image, button) omit
+   * `node.children` to their IDs. Leaf modules (text, image, base.button) omit
    * this flag so they remain childless.
    *
    * A predicate form lets a rule decide per element — used by the anchor rule
@@ -41,6 +42,17 @@ export interface ImportRule {
 /** True when the element has at least one element (non-text) child. */
 function hasElementChild(el: Element): boolean {
   return el.children.length > 0
+}
+
+/**
+ * True for a `<button>` the form modules treat as its form's submit control:
+ * an explicit `type="submit"`, or no type at all while inside a `<form>`
+ * (the HTML default). Shared by the button rule's `map` and `recurse` so both
+ * agree on which buttons must stay base.submit.
+ */
+function isSubmitButton(el: Element): boolean {
+  const type = normalizedAttr(el, 'type')
+  return type === 'submit' || (!type && el.closest('form') !== null)
 }
 
 const TEXT_INPUT_TYPES = [
@@ -64,6 +76,24 @@ function attr(el: Element, name: string): string {
 
 function normalizedAttr(el: Element, name: string): string {
   return attr(el, name).trim().toLowerCase()
+}
+
+const IMAGE_LOADING_VALUES = ['lazy', 'eager'] as const
+const IMAGE_DECODING_VALUES = ['async', 'sync', 'auto'] as const
+const IMAGE_FETCH_PRIORITY_VALUES = ['auto', 'high', 'low'] as const
+
+/**
+ * `{ [propName]: value }` when the attribute holds one of `allowed`
+ * (case-insensitively), else `{}` so the module default applies.
+ */
+function enumAttr<T extends string>(
+  el: Element,
+  attrName: string,
+  propName: string,
+  allowed: readonly T[],
+): Record<string, T> {
+  const value = normalizedAttr(el, attrName)
+  return (allowed as readonly string[]).includes(value) ? { [propName]: value as T } : {}
 }
 
 function numberAttr(el: Element, name: string, fallback: number = 0): number {
@@ -352,18 +382,29 @@ export const HTML_TO_MODULE_RULES: ImportRule[] = [
     },
   },
 
-  // btn-classed anchors → base.button (prop `label`). LEAF — base.button
-  // cannot have children, so a btn wrapping an icon keeps only its label.
+  // btn-classed anchors → base.button (prop `label`). LEAF only while the
+  // anchor holds nothing but text: base.button is `canHaveChildren: false`, so
+  // a `.btn` wrapping an icon / inline `<svg>` / `<img>` would keep just its
+  // label and drop the rest. Those recurse into base.link instead — the same
+  // treatment the plain anchor rule below gives a compound `<a>` — which keeps
+  // href and target. The `btn` class rides along as a classId, so the swap does
+  // not change how the element is styled.
+  //
+  // `target` is normalised, not copied: an empty attribute, `_top` or a named
+  // frame is not in `AnchorTargetSchema`. Preserve the intended browsing
+  // context here instead of relying on the publisher's default-target repair.
   {
     match: 'a.btn',
-    map: (el) => ({
-      moduleId: 'base.button',
-      props: {
-        label: normalizeImportedText(el.textContent ?? ''),
-        href: el.getAttribute('href') ?? '',
-        target: el.getAttribute('target') ?? '_self',
-      },
-    }),
+    map: (el) => {
+      const text = normalizeImportedText(el.textContent ?? '')
+      const href = el.getAttribute('href') ?? ''
+      const target = normalizeAnchorTarget(el.getAttribute('target'))
+
+      return hasElementChild(el)
+        ? { moduleId: 'base.link', props: { text, href, target } }
+        : { moduleId: 'base.button', props: { label: text, href, target } }
+    },
+    recurse: hasElementChild,
   },
 
   // Plain anchors → base.link (prop `text`). Recurse ONLY when the anchor wraps
@@ -377,7 +418,7 @@ export const HTML_TO_MODULE_RULES: ImportRule[] = [
       props: {
         text: normalizeImportedText(el.textContent ?? ''),
         href: el.getAttribute('href') ?? '',
-        target: el.getAttribute('target') ?? '_self',
+        target: normalizeAnchorTarget(el.getAttribute('target')),
       },
     }),
     recurse: hasElementChild,
@@ -398,24 +439,41 @@ export const HTML_TO_MODULE_RULES: ImportRule[] = [
     }),
   },
 
-  // Images. `src` only — alt text is sourced from the media library asset,
-  // not stored as a per-instance prop. LEAF.
+  // Images. `src` plus the authored perf hints, mapped onto the module's
+  // first-class props only when the value is one the module offers — anything
+  // else keeps the module default. `alt` is NOT a prop: the Media Library asset
+  // is the single source of truth, so the walker reports it separately
+  // (`imageAlts`) and the site importer creates the record with it. LEAF.
   {
     match: 'img',
     map: (el) => ({
       moduleId: 'base.image',
-      props: { src: el.getAttribute('src') ?? '' },
+      props: {
+        src: el.getAttribute('src') ?? '',
+        ...enumAttr(el, 'loading', 'loading', IMAGE_LOADING_VALUES),
+        ...enumAttr(el, 'decoding', 'decoding', IMAGE_DECODING_VALUES),
+        ...enumAttr(el, 'fetchpriority', 'fetchPriority', IMAGE_FETCH_PRIORITY_VALUES),
+      },
     }),
   },
 
   // Buttons → base.button or base.submit. A button without type submits only
   // when it is inside a form; outside forms it remains a regular base.button,
   // preserving the pre-existing HTML-import behavior for standalone buttons.
+  //
+  // A non-submit button that WRAPS element children (icon + span label, an
+  // `<img>` thumbnail) recurses into a container tagged `button`, because
+  // base.button is `canHaveChildren: false` and would keep only the text.
+  // Submit buttons stay on base.submit even when compound: `core/forms`
+  // identifies a form's submit control by that module id, so re-tagging one as
+  // a container would leave the form without a submit. base.submit accepts
+  // children, so a compound submit recurses too and its content (an icon-only
+  // `<svg>`, an icon-font `<i>`, an `<img>`) survives as child nodes; `label`
+  // stays as the childless fallback, the base.link contract.
   {
     match: 'button',
     map: (el) => {
-      const type = normalizedAttr(el, 'type')
-      if (type === 'submit' || (!type && el.closest('form'))) {
+      if (isSubmitButton(el)) {
         return {
           moduleId: 'base.submit',
           props: {
@@ -425,15 +483,24 @@ export const HTML_TO_MODULE_RULES: ImportRule[] = [
           },
         }
       }
+
+      if (hasElementChild(el)) {
+        return {
+          moduleId: 'base.container',
+          props: { tag: 'custom', customTag: 'button' },
+        }
+      }
+
       return {
         moduleId: 'base.button',
         props: {
           label: normalizeImportedText(el.textContent ?? ''),
           disabled: el.hasAttribute('disabled'),
-          buttonType: type === 'reset' ? 'reset' : 'button',
+          buttonType: normalizedAttr(el, 'type') === 'reset' ? 'reset' : 'button',
         },
       }
     },
+    recurse: hasElementChild,
   },
 
   // ul / ol are BUILTIN_HTML_TAGS for base.container → container + RECURSE.
@@ -552,6 +619,7 @@ export const HTML_TO_MODULE_RULES: ImportRule[] = [
         moduleId: 'base.video',
         props: {
           videoUrl,
+          poster: attr(el, 'poster'),
           autoplay: el.hasAttribute('autoplay'),
           loop: el.hasAttribute('loop'),
           muted: el.hasAttribute('muted'),

@@ -50,7 +50,11 @@
  *   - `applyPublishedHtmlPipeline` fires at publish time for static
  *     routes — plugin frontend injections and filters are baked into
  *     the artefact. The disk path never calls the pipeline per request.
- *   - For non-static routes (loops, request-dependent bindings), the
+ *   - A baked artefact is served with no knowledge of the publish version, so
+ *     whatever makes one stale must remove or rewrite it. A row publish or
+ *     retraction removes the artefacts that loop over the row's table
+ *     (`loopArtefacts.ts`).
+ *   - For a route with no artefact (never baked, or removed as above), the
  *     live-render fallback runs once per (urlPath, canonicalQuery, publishVersion)
  *     burst and the result is stored in the Layer B LRU.
  *   - Only requests whose canonical query is empty hit the disk path. Junk
@@ -90,7 +94,7 @@ import { canonicalRenderQuery } from './loopPrefetch'
  *
  * Shared with the loop runtime so per-page slug resolution stays consistent.
  */
-function publicSlugFromPath(pathname: string): string {
+export function publicSlugFromPath(pathname: string): string {
   const trimmed = pathname.replace(/^\/+|\/+$/g, '')
   return trimmed === '' ? 'index' : trimmed
 }
@@ -101,7 +105,7 @@ function publicSlugFromPath(pathname: string): string {
  * have at least two segments — the caller should treat those as
  * "not a content-row URL" and move on.
  */
-function contentRouteFromPath(pathname: string): { tableRouteBase: string; rowSlug: string } | null {
+export function contentRouteFromPath(pathname: string): { tableRouteBase: string; rowSlug: string } | null {
   const parts = pathname.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean)
   if (parts.length < 2) return null
   return {

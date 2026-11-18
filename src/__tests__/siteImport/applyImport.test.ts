@@ -39,7 +39,7 @@ interface MockTxOp {
   type:
     | 'addPage'
     | 'overwritePage'
-    | 'addStyleRule'
+    | 'putStyleRule'
     | 'overwriteStyleRule'
     | 'addFonts'
     | 'addInstalledFonts'
@@ -59,17 +59,21 @@ function makeMockAdapter(opts?: {
   commitFail?: boolean
 }): SiteImportAdapter & {
   uploads: string[]
+  /** Alt text handed to `uploadAsset`, keyed by source path (absent = none authored). */
+  uploadAlts: Record<string, string | undefined>
   installs: { family: string; variants: string[]; subsets: string[] }[]
   ops: MockTxOp[]
 } {
   let idCounter = 0
   const nextId = () => `mock-id-${++idCounter}`
   const uploads: string[] = []
+  const uploadAlts: Record<string, string | undefined> = {}
   const installs: { family: string; variants: string[]; subsets: string[] }[] = []
   const ops: MockTxOp[] = []
 
   return {
     uploads,
+    uploadAlts,
     installs,
     async installGoogleFont(request) {
       installs.push(request)
@@ -93,7 +97,8 @@ function makeMockAdapter(opts?: {
     async uploadAsset(file) {
       if (opts?.uploadFail) throw new Error('upload failure')
       uploads.push(file.path)
-      return `/uploads/media/${file.path.replace(/[^a-z0-9.]/g, '_')}`
+      uploadAlts[file.path] = file.altText
+      return { url: `/uploads/media/${file.path.replace(/[^a-z0-9.]/g, '_')}`, warnings: [] }
     },
     async commit(recipe) {
       if (opts?.commitFail) throw new Error('commit failure')
@@ -107,9 +112,9 @@ function makeMockAdapter(opts?: {
           const id = pageId
           ops.push({ type: 'overwritePage', args: { pageId, ...input }, id })
         },
-        addStyleRule(rule) {
+        putStyleRule(rule) {
           const id = nextId()
-          ops.push({ type: 'addStyleRule', args: rule, id })
+          ops.push({ type: 'putStyleRule', args: rule, id })
           return id
         },
         overwriteStyleRule(ruleId, rule) {
@@ -236,6 +241,13 @@ describe('buildImportPlan — structure', () => {
     const sourcePaths = plan.assets.map((a) => a.sourcePath)
     expect(sourcePaths).toContain('images/hero.png')
     expect(sourcePaths).toContain('images/logo.png')
+  })
+
+  it('carries each image\'s authored alt text onto its planned asset', () => {
+    // INDEX_HTML: <img src="images/hero.png" alt="Hero">; ABOUT_HTML: alt="Logo".
+    const byPath = new Map(plan.assets.map((a) => [a.sourcePath, a.altText]))
+    expect(byPath.get('images/hero.png')).toBe('Hero')
+    expect(byPath.get('images/logo.png')).toBe('Logo')
   })
 
   it('plan.assets contains only media files — HTML pages are excluded even when linked via anchor', () => {
@@ -470,6 +482,43 @@ describe('buildImportPlan — structure', () => {
     expect(p.unusedCss).toContain('styles/unused.css')
   })
 
+  it('rewrites var() references to the slug a root colour token is emitted under (#615)', () => {
+    const html = `<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body>
+      <h1 class="title">Home</h1><a class="link" href="/">Link</a>
+      <p style="border-color: var(--brand---neutral--700, red)">Note</p>
+    </body></html>`
+    const css = `
+      :root {
+        --brand---neutral--700: #4f5459;
+        --brand-primary: #0575d6;
+        --alias: var(--brand---neutral--700);
+      }
+      .title { color: var(--brand---neutral--700); }
+      .link { color: var(--brand-primary); }
+      .dark { --brand---neutral--700: #000; }
+    `
+    const p = buildImportPlan({
+      fileMap: makeSinglePageFileMap(html, css),
+      currentSite: makeEmptySiteDocument(),
+    })
+
+    expect(p.colors).toEqual([
+      { slug: 'brand-neutral-700', value: '#4f5459' },
+      { slug: 'brand-primary', value: '#0575d6' },
+    ])
+    const rule = (selector: string) => p.styleRules.find((r) => r.selector === selector)
+    expect(rule('.title')?.styles.color).toBe('var(--brand-neutral-700)')
+    expect(rule('.link')?.styles.color).toBe('var(--brand-primary)')
+    expect(rule(':root')?.styles).toEqual({ '--alias': 'var(--brand-neutral-700)' })
+    // A non-root override follows the token to its new name.
+    expect(rule('.dark')?.styles).toEqual({ '--brand-neutral-700': '#000' })
+    const inline = Object.values(p.pages[0].nodeFragment.nodes)
+      .map((node) => node.inlineStyles)
+      .find((styles) => styles && 'borderColor' in styles)
+    expect(inline?.borderColor).toBe('var(--brand-neutral-700, red)')
+    expect(p.conflicts.tokens).toHaveLength(0)
+  })
+
   it('extracts root font variables into font tokens', () => {
     const html = `<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><h1>Home</h1></body></html>`
     const css = `
@@ -495,6 +544,80 @@ describe('buildImportPlan — structure', () => {
     const root = p.styleRules.find((rule) => rule.selector === ':root')
     expect(root?.styles).toEqual({ '--font-size-base': '16px' })
     expect(p.styleRules.find((rule) => rule.selector === 'h1')?.styles.fontFamily).toBe('var(--font-display)')
+  })
+
+  it('rewrites var() references to the variable a root font token is emitted under (#619)', () => {
+    const html = `<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body>
+      <h1 class="title">Home</h1><p class="body">Body</p><p class="hero">Hero</p>
+    </body></html>`
+    const css = `
+      :root {
+        --font-Heading: "Acme Grotesk", serif;
+        --font-body--alt: "Inter", sans-serif;
+        --font-display: "Acme Grotesk", serif;
+      }
+      .title { font-family: var(--font-Heading); }
+      .body { font-family: var(--font-body--alt); }
+      .hero { font-family: var(--font-display); }
+      .dark { --font-Heading: Georgia, serif; }
+    `
+    const p = buildImportPlan({
+      fileMap: makeSinglePageFileMap(html, css),
+      currentSite: makeEmptySiteDocument(),
+    })
+
+    expect(p.fontTokens.map((t) => [t.name, t.variable])).toEqual([
+      ['Heading', 'font-heading'],
+      ['Body Alt', 'font-body-alt'],
+      ['Display', 'font-display'],
+    ])
+    const rule = (selector: string) => p.styleRules.find((r) => r.selector === selector)
+    expect(rule('.title')?.styles.fontFamily).toBe('var(--font-heading)')
+    expect(rule('.body')?.styles.fontFamily).toBe('var(--font-body-alt)')
+    expect(rule('.hero')?.styles.fontFamily).toBe('var(--font-display)')
+    // A non-root override follows the token to its new name.
+    expect(rule('.dark')?.styles).toEqual({ '--font-heading': 'Georgia, serif' })
+    expect(p.conflicts.tokens).toHaveLength(0)
+  })
+
+  it('keeps both font tokens when two names normalise to the same variable', () => {
+    const html = `<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><h1>x</h1></body></html>`
+    const css = `
+      :root { --font-Heading: "Acme Grotesk", serif; --font-heading: "Inter", sans-serif; }
+      h1 { font-family: var(--font-Heading); }
+      h2 { font-family: var(--font-heading); }
+    `
+    const p = buildImportPlan({
+      fileMap: makeSinglePageFileMap(html, css),
+      currentSite: makeEmptySiteDocument(),
+    })
+
+    // The name already in emitted form keeps it; the other takes a suffix.
+    expect(p.fontTokens.map((t) => [t.name, t.variable, t.family])).toEqual([
+      ['Heading 2', 'font-heading-2', 'Acme Grotesk'],
+      ['Heading', 'font-heading', 'Inter'],
+    ])
+    expect(p.styleRules.find((r) => r.selector === 'h1')?.styles.fontFamily).toBe('var(--font-heading-2)')
+    expect(p.styleRules.find((r) => r.selector === 'h2')?.styles.fontFamily).toBe('var(--font-heading)')
+  })
+
+  it('does not give a font token the name of an imported colour token', () => {
+    const html = `<!doctype html><html><head><link rel="stylesheet" href="style.css"></head><body><h1>x</h1></body></html>`
+    const css = `
+      :root { --font-accent: #fc834b; --font-Accent: "Inter", sans-serif; }
+      h1 { color: var(--font-accent); font-family: var(--font-Accent); }
+    `
+    const p = buildImportPlan({
+      fileMap: makeSinglePageFileMap(html, css),
+      currentSite: makeEmptySiteDocument(),
+    })
+
+    expect(p.colors).toEqual([{ slug: 'font-accent', value: '#fc834b' }])
+    expect(p.fontTokens.map((t) => t.variable)).toEqual(['font-accent-2'])
+    expect(p.styleRules.find((r) => r.selector === 'h1')?.styles).toMatchObject({
+      color: 'var(--font-accent)',
+      fontFamily: 'var(--font-accent-2)',
+    })
   })
 
   it('plans Google Fonts @import as installed font requests', () => {
@@ -650,6 +773,14 @@ describe('commitImportPlan — happy path', () => {
     expect(adapter.uploads).toContain('images/logo.png')
   })
 
+  it('hands each asset\'s authored alt text to the upload', async () => {
+    const adapter = makeMockAdapter()
+    const plan = buildImportPlan({ fileMap: makeSampleFileMap(), currentSite: makeEmptySiteDocument() })
+    await commitImportPlan(plan, adapter)
+    expect(adapter.uploadAlts['images/hero.png']).toBe('Hero')
+    expect(adapter.uploadAlts['images/logo.png']).toBe('Logo')
+  })
+
   it('calls addPage for each non-conflicting page', async () => {
     const plan = buildImportPlan({ fileMap: makeSampleFileMap(), currentSite: makeEmptySiteDocument() })
     const adapter = makeMockAdapter()
@@ -658,11 +789,11 @@ describe('commitImportPlan — happy path', () => {
     expect(addPageOps).toHaveLength(3)
   })
 
-  it('calls addStyleRule for each non-conflicting rule', async () => {
+  it('calls putStyleRule for each non-conflicting rule', async () => {
     const plan = buildImportPlan({ fileMap: makeSampleFileMap(), currentSite: makeEmptySiteDocument() })
     const adapter = makeMockAdapter()
     await commitImportPlan(plan, adapter)
-    const addRuleOps = adapter.ops.filter((o) => o.type === 'addStyleRule')
+    const addRuleOps = adapter.ops.filter((o) => o.type === 'putStyleRule')
     expect(addRuleOps.length).toBeGreaterThan(0)
   })
 

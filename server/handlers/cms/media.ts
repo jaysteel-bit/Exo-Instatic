@@ -57,10 +57,9 @@ import {
   MAX_MEDIA_BYTES,
   acceptReplacementMedia,
   acceptUploadedMedia,
-  readUploadedFile,
+  readUploadForm,
 } from './mediaUpload'
-import { removeVariantFiles } from './mediaVariants'
-import { dispatchDelete } from './mediaUploadDispatch'
+import { removeMediaAssetFiles } from './mediaVariants'
 import { materializeAssetListForClient } from '../../publish/mediaPresentation'
 
 const MEDIA_LIBRARY_MIMES = Object.keys(EXTENSION_FOR_MIME) as Array<
@@ -149,7 +148,7 @@ async function handleUploadMedia(req: Request, db: DbClient): Promise<Response> 
   const user = await requireCapability(req, db, 'media.write')
   if (user instanceof Response) return user
 
-  const file = await readUploadedFile(req)
+  const { file, altText } = await readUploadForm(req)
   if (!file) return badRequest('Missing file')
 
   const result = await acceptUploadedMedia(db, {
@@ -158,6 +157,7 @@ async function handleUploadMedia(req: Request, db: DbClient): Promise<Response> 
     allowedMimes: MEDIA_LIBRARY_MIMES,
     role: 'original',
     uploadedByUserId: user.id,
+    ...(altText !== undefined ? { altText } : {}),
     oversizedMessage: 'File exceeds the 50 MB hard limit',
     unsupportedMessage: 'Only JPEG, PNG, GIF, WebP, SVG, MP4, WebM, and web font (WOFF, WOFF2, TTF, OTF) files can be uploaded',
   })
@@ -189,7 +189,7 @@ async function handleReplaceMedia(
   const user = await requireCapability(req, db, 'media.replace')
   if (user instanceof Response) return user
 
-  const file = await readUploadedFile(req)
+  const { file } = await readUploadForm(req)
   if (!file) return badRequest('Missing file')
 
   const result = await acceptReplacementMedia(db, params.id, {
@@ -272,17 +272,10 @@ async function handleDeleteMedia(
   if (!existing) return notFound()
   if (!existing.deletedAt) return badRequest('Asset must be soft-deleted before purge')
 
-  // Snapshot the variant list BEFORE the row delete so we know which
-  // extra bytes to sweep from each variant's adapter alongside the original.
-  const variants = existing.variants
-  const adapterId = existing.storageAdapterId
   const deleted = await deleteMediaAsset(db, params.id)
   if (!deleted) return notFound()
 
-  await dispatchDelete(adapterId, deleted.storagePath).catch((err) => {
-    console.error('[media] hard-delete original byte sweep failed (orphaned bytes):', err)
-  })
-  await removeVariantFiles(variants)
+  await removeMediaAssetFiles(deleted)
   return jsonResponse({ ok: true })
 }
 

@@ -18,16 +18,19 @@
 import { nanoid } from 'nanoid'
 import type { DbClient } from '../../db/client'
 import { hashPassword } from '../../auth/tokens'
-import { createSite, getSetupStatus } from '../../repositories/setup'
+import { createSite, getSetupStatus, newSiteShellStorage } from '../../repositories/setup'
 import { createUser } from '../../repositories/users'
 import { createAuditEvent } from '../../repositories/audit'
 import { createDataRow } from '../../repositories/data'
 import { createNode } from '@core/page-tree'
+import { isValidEmail } from '@core/utils/email'
+import { MIN_PASSWORD_LENGTH, PASSWORD_TOO_SHORT_MESSAGE } from '@core/utils/passwordPolicy'
 import { pageToCells } from '../../../src/core/data/pageFromRow'
 import type { Page } from '@core/page-tree'
 import { badRequest, jsonResponse, methodNotAllowed, readValidatedBody } from '../../http'
 import { Type, safeParseValue } from '@core/utils/typeboxHelpers'
 import type { SiteRow } from '../../types'
+import { MAIN_SCOPE } from '../../branches/scope'
 import { CMS_API_PREFIX, requestAuditContext } from './shared'
 import {
   notifyRowWrite,
@@ -71,13 +74,13 @@ export async function handleSetupRoutes(req: Request, db: DbClient): Promise<Res
     const displayName = body.displayName?.trim() ?? ''
 
     if (!siteName) return badRequest('Missing siteName')
-    if (!email.includes('@')) return badRequest('Invalid email')
-    if (password.length < 12) return badRequest('Password must be at least 12 characters')
+    if (!isValidEmail(email)) return badRequest('Invalid email address')
+    if (password.length < MIN_PASSWORD_LENGTH) return badRequest(PASSWORD_TOO_SHORT_MESSAGE)
 
     return serializeCollabAwareWrite(async () => {
       let homePageId = ''
       const response = await db.transaction(async (tx) => {
-        await createSite(tx, siteName, {})
+        await createSite(tx, siteName, newSiteShellStorage())
         const owner = await createUser(tx, {
           id: nanoid(),
           email,
@@ -106,6 +109,7 @@ export async function handleSetupRoutes(req: Request, db: DbClient): Promise<Res
         homePageId = homePage.id
         await createDataRow(
           tx,
+          MAIN_SCOPE,
           { id: homePage.id, tableId: 'pages', cells: pageToCells(homePage), slug: homePage.slug },
           owner.id,
           null,
@@ -113,8 +117,8 @@ export async function handleSetupRoutes(req: Request, db: DbClient): Promise<Res
         )
         return jsonResponse({ ok: true }, { status: 201 })
       })
-      notifyShellWrite()
-      notifyRowWrite({ tableId: 'pages', rowIds: [homePageId], kind: 'create' })
+      notifyShellWrite(MAIN_SCOPE.branchId)
+      notifyRowWrite({ branchId: MAIN_SCOPE.branchId, tableId: 'pages', rowIds: [homePageId], kind: 'create' })
       return response
     })
   }
@@ -138,7 +142,7 @@ interface PublicSiteIdentity {
  * favicon resolve to null. TypeBox objects allow extra properties by default,
  * so validating only `faviconUrl` still type-checks it with zero `as` casts
  * while staying immune to unrelated settings fields. Every level is optional
- * so a freshly-created site (`settings_json = {}`) yields a null favicon
+ * so a shell without stored settings (`settings_json = {}`) yields a null favicon
  * instead of throwing.
  */
 const StoredSiteIdentitySchema = Type.Object({

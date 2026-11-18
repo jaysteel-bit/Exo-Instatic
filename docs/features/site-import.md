@@ -4,6 +4,8 @@
 
 The static-site pipeline has two parts: a pure analysis function (`buildImportPlan`) that produces an `ImportPlan` preview, and an async commit function (`commitImportPlan`) that uploads assets and writes to the store. CMS bundle imports keep their native semantics: validate the `SiteBundle`, preview against `/admin/api/cms/import/preview`, resolve any row slug conflicts in the shared Conflicts step, then apply through `/admin/api/cms/import` or `/admin/api/cms/import/archive`. The modal uses the same Review category navigator and Import progress surface for CMS bundles, so tables, media, folders, redirects, conflict resolution, and completion all live in the same picker pattern as HTML/CSS/media imports.
 
+WebKit-prefixed CSS properties and declarations containing `var()`, `env()`, `clamp()`, `min()`, or `max()` pass through the shared CSS substitution encoder before CSSOM parsing. This preserves their authored values in both browser and headless imports, including centered section padding and responsive wrapper widths. The decoder restores the original property names before storage.
+
 ---
 
 ## TL;DR
@@ -12,11 +14,12 @@ The static-site pipeline has two parts: a pure analysis function (`buildImportPl
 - `buildImportPlan({ fileMap, currentSite, options })` — pure, synchronous — produces an `ImportPlan` with pages, style rules, kept stylesheet files, media, color tokens, custom fonts, Google font install requests, font tokens, scripts, and script npm dependencies inferred from known ESM CDNs.
 - **Per-stylesheet import modes:** each top-level linked stylesheet either converts to editable style rules (default) or imports verbatim as a page-scoped `SiteFile` stylesheet (`options.stylesheetModes`, picked in the Review step). There are no generated scope classes — page isolation comes from the kept file's runtime scope.
 - `commitImportPlan(plan, adapter)` — uploads assets, then wraps all store writes in a single `adapter.commit` call → one Cmd+Z reverts the whole import.
-- Static imports load the current CMS draft into the editor store on demand when launched outside `/admin/site`; if no draft exists, the modal creates an empty site before analysis.
-- Conflict resolution: rename with a numeric suffix (default), overwrite, skip, or custom-rename — per page slug, per class name, per design token (colour / font CSS variable), and per divergent cross-stylesheet class definition, with category-level bulk actions. Token renames rewrite `var(--x)` references so imports stay faithful.
+- Static imports load the current CMS draft into the editor store on demand when launched outside `/admin/site`; if no draft exists, the modal creates an empty site before analysis. After completion, **Open site** selects the first imported page and navigates through the admin router to `/admin/site?table=pages&row=<pageId>`, including when the import began in another workspace.
+- Conflict resolution: rename with a numeric suffix (default), overwrite, skip, or custom-rename — per page slug, per class name, per design token (colour / font CSS variable), and per divergent cross-stylesheet class definition, with category-level bulk actions. Token renames rewrite `var(--x)` references, and declarations of the same variable in other rules, so imports stay faithful.
 - What imports: pages, linked CSS plus unconditional local CSS `@import` graphs, `kind:'class'` and `kind:'ambient'` style rules, stylesheets kept as page-scoped files, `@keyframes`, uploadable media/font files, root CSS color tokens, root CSS font tokens, `@font-face` families, known external font stylesheet imports, safe extra HTML attributes on base modules, body-level classes/attributes/style metadata, bare DOM text nodes in mixed content, and executable HTML scripts as page-scoped runtime scripts. Module-script imports from known npm CDNs are rewritten to bare package imports and added to the site dependency manifest.
 - CMS bundle import preserves selected exported tables, rows, optional site shell, media, folders, and redirects using the same merge strategies as site transfer (`replace`, `merge-add`, `merge-overwrite`).
 - HTML forms import through the shared HTML importer as first-class form primitives (`base.form`, controls, labels, submit buttons), not as custom containers.
+- Imported self-hosted `@font-face` files retain their `font-display` descriptor in the native font library. An omitted descriptor imports as CSS's `auto`; fonts installed through other paths continue to default to `swap`.
 - What cannot be modeled: `@layer`, conditional local CSS `@import`, and arbitrary external `@import` — surfaced as warnings when the CSS engine exposes them, never silently dropped.
 - Headless: `src/core/siteImport/` carries no admin, React, or server imports (gated by `siteImport-headless.test.ts`).
 
@@ -36,6 +39,7 @@ src/core/siteImport/
 ├── fontTokens.ts        — extract root --font-* custom properties as ImportFontToken[] from :root/html/body rules
 ├── fontImports.ts       — resolve trusted Google CSS2 @import rules into installed-font requests
 ├── scriptDependencies.ts — rewrite known npm ESM CDN imports in module scripts into bare package imports + dependency requests
+├── scriptOrder.ts       — merge every page's script document order into the one priority sequence the runtime sorts by
 ├── cssImports.ts        — expand unconditional local CSS @import graphs while preserving each source path
 ├── classCascades.ts     — cross-sheet class semantics: detect divergent class definitions as explicit conflicts; apply rename / keep-first / overwrite; enforce one bindable class rule per name
 ├── mimeTypes.ts         — extension → MIME fallback for FileMap entries that carry no MIME type (e.g. ZIP)
@@ -43,6 +47,8 @@ src/core/siteImport/
 ├── applyAssetRewrites.ts — patch fragment props + CSS/@keyframes url() with new media URLs (post-upload)
 ├── linkRewrite.ts       — rewrite intra-site <a href> to cms:page:<id> refs
 ├── conflicts.ts         — detect page-slug + class-name + design-token collisions; apply resolutions (incl. var(--x) rewrites)
+├── tokenNames.ts        — settle the emitted name of every imported colour + font token (authored → emitted renames)
+├── varRefs.ts           — rename a custom property across imported rules, inline styles and @keyframes (var(--x) refs + --x declarations)
 ├── adapter.ts           — SiteImportAdapter + SiteImportTransaction interfaces (the ONE transaction contract; the editor store implements it directly)
 ├── paths.ts             — dirname/joinPaths for FileMap-relative path resolution
 ├── planCss.ts           — single CSS-source parse path (external sheets + per-page inline <style>) feeding shared plan accumulators
@@ -137,7 +143,7 @@ User drops files / folder / static .zip / CMS bundle .zip
       Step C: adapter.commit(tx) — single atomic store mutation:
                 tx.addConditions / tx.addColorTokens / tx.overwriteColorTokens / tx.addScripts
                 tx.addFonts / tx.addFontTokens / tx.overwriteFontTokens
-                tx.addStyleRule / tx.overwriteStyleRule
+                tx.putStyleRule / tx.overwriteStyleRule
                 tx.addPage / tx.overwritePage / tx.addStylesheets
             │
             ▼
@@ -157,7 +163,7 @@ interface ImportPlan {
   googleFonts:     ImportGoogleFont[]
   fontTokens:      ImportFontToken[]
   conditions:      ConditionDef[]
-  assets:          { sourcePath: string; mimeType: string; bytes: Uint8Array }[]
+  assets:          ImportAsset[]        // { sourcePath, mimeType, bytes, altText? }
   colors:          ImportColorToken[]
   scripts:         ImportScript[]
   linkedStylesheets: LinkedStylesheet[]   // every top-level linked sheet + its import mode
@@ -176,6 +182,10 @@ interface ImportPlan {
 
 All URL-shaped values inside `pages[].nodeFragment` props, imported `htmlAttributes` bags, style rule `styles`/`contextStyles`, and supported raw style-rule blocks such as `@keyframes` are normalised to FileMap keys before the plan is returned — `applyAssetRewrites` does exact-string replacement after upload.
 
+Every `styleRules[]` entry carries `origin: { source, ordinal }` — the stylesheet it came from and its position in it — which the committed `StyleRule` keeps. That is what a re-import reconciles against (see "Re-importing a site" below). `styleRuleSources` stays alongside as the wizard's index-aligned display grouping: a rule the cross-sheet resolver materialises has a display group but no origin.
+
+`PagePlan.imageAlts` maps each `base.image` node id to the authored `<img alt>` (an empty string is a deliberate decorative alt). `buildAssetPlan` copies it onto the planned `ImportAsset.altText` — first page to describe a file wins — and the upload creates the Media Library record with it. Alt is never a per-instance prop.
+
 `ImportScript` entries carry optional npm dependency requests when module-script CDN imports were converted:
 
 ```ts
@@ -189,6 +199,8 @@ interface ImportScript {
 }
 ```
 
+`priority` is one number per script, so it is derived from every page's document order at once (`scriptOrder.ts`): each page contributes "a before b" edges between neighbouring scripts, the merged order is a topological sort with first-seen order as the tie-break, and a script shared by two pages therefore sorts after whatever either page loads before it. Pages that genuinely contradict each other keep the first page's order and emit a `script-order-conflict` warning.
+
 ---
 
 ## What each category imports
@@ -198,11 +210,11 @@ interface ImportScript {
 | **Pages** | One `PagePlan` per `.html` file | `makeHtmlPagePlan` parses the body via `@core/htmlImport`; slug derived from the relative file path (`documentation/index.html` → `documentation`, `guides/install.html` → `guides/install`) |
 | **HTML attributes** | Safe extra attributes on ordinary elements (`id`, ARIA, `role`, custom attrs, `data-*`, etc.) | Stored as `props.htmlAttributes` on base container/text/link/button/image modules so CSS selectors, anchors, classic scripts, accessibility attributes, and template runtime hooks such as `data-bg-src`, `data-aos`, and `data-bs-*` survive import. Users edit the same bag in the Properties panel's Attributes view. `class` is handled by the selector registry, inline `style` becomes `node.inlineStyles`, event handlers are stripped, and reserved Instatic/editor `data-*` names are not imported. Local asset URLs inside these attributes are uploaded and rewritten. |
 | **Style rules** | All rules from linked CSS files and their unconditional local `@import` graph | `expandLinkedCssImports` follows bundled local CSS imports first, then `cssToStyleRules` maps selector declaration blocks to `NewStyleRule` entries (class or ambient kind) and stores supported stylesheet-level rules such as `@keyframes` as ambient raw CSS rules |
-| **Media** | Uploadable images, videos, and fonts — including unreferenced files in the bundle | `buildAssetPlan` collects referenced assets and sweeps uploadable unreferenced files. Source companions such as `.scss`, sourcemaps, PHP mailers, `desktop.ini`, and README files are excluded before upload. |
-| **Color tokens** | CSS custom properties on `:root` / `html` / `body` that look like colours | `extractRootColorTokens` pulls them into `ImportColorToken[]`; they become framework palette tokens. The framework parses hex, rgb/rgba, and hsl/hsla into channels (deriving shades/tints/transparent steps); any other authored value (oklch(), color-mix(), …) still emits its base `--<slug>` verbatim so `var(--x)` references never break. A `--<slug>` that collides with an existing colour token surfaces as a `TokenConflict` (rename / skip / overwrite) |
+| **Media** | Uploadable images (JPEG, PNG, GIF, WebP, AVIF, SVG), videos, and fonts — including unreferenced files in the bundle | `buildAssetPlan` collects referenced assets and sweeps uploadable unreferenced files. Source companions such as `.scss`, sourcemaps, PHP mailers, `desktop.ini`, and README files are excluded before upload. An `<img>`'s authored `alt` is carried onto the asset and stored on the Media Library record at upload; `loading`, `decoding`, and `fetchpriority` map onto the Image module's first-class props when they hold a value the module offers (anything else keeps the module default). Uploaded assets are filed under folders mirroring their bundle path; a folder failure leaves the asset at the media root with an `asset-folder-failed` warning and never blocks the URL rewrite. |
+| **Color tokens** | CSS custom properties on `:root` / `html` / `body` that look like colours | `extractRootColorTokens` pulls them into `ImportColorToken[]`; they become framework palette tokens. The framework parses hex, rgb/rgba, and hsl/hsla into channels (deriving shades/tints/transparent steps); any other authored value (oklch(), color-mix(), …) still emits its base `--<slug>` verbatim so `var(--x)` references never break. The slug is the framework's normalised form (`--brand---neutral--700` → `--brand-neutral-700`), settled at plan time by `normalizeImportedTokens` (`tokenNames.ts`); every imported `var()` reference and declaration of a renamed name is rewritten to it, and two names that normalise to the same slug both survive (the one already in normalised form keeps it, the other takes a `-2` suffix). A `--<slug>` that collides with an existing colour token surfaces as a `TokenConflict` (rename / skip / overwrite) |
 | **Fonts** | Self-hosted `@font-face` families with at least one bundled file, plus trusted Google CSS2 imports | `buildFontFamilies` in `assetPlan.ts` picks the best bundled format (woff2 → woff → ttf → otf); `extractGoogleFontImports` turns Google CSS2 `@import` rules into install requests. Commit uploads custom files via `tx.addFonts`, installs Google families through the CMS Google-font installer, then merges those returned `FontEntry` records via `tx.addInstalledFonts` |
-| **Font tokens** | Root `--font-*` variables with font-family stacks | `extractRootFontTokens` pulls them into `ImportFontToken[]`; committed via `tx.addFontTokens` after fonts so matching imported families can be assigned. A `--font-*` that collides with an existing font token surfaces as a `TokenConflict` (rename / skip / overwrite) |
-| **Scripts** | Executable inline scripts and JS files linked by imported HTML | Preserved in source order and committed via `tx.addScripts` with page scope from the source HTML. Classic scripts remain plain `<script>` assets and bypass bundling; `type="module"` scripts keep module semantics. Module imports from known npm CDNs (`esm.sh`, `esm.run`, `unpkg`, jsDelivr npm URLs) are rewritten to bare package specifiers and recorded as runtime dependencies, so `https://esm.sh/@motion.page/sdk@1.2.4` becomes `@motion.page/sdk` plus `@motion.page/sdk: 1.2.4` in `packageJson.dependencies`. Non-executable script data such as `application/json`, import maps, and templates is skipped. |
+| **Font tokens** | Root `--font-*` variables with font-family stacks | `extractRootFontTokens` pulls them into `ImportFontToken[]`. The variable is the store's normalised form (`--font-Heading` → `--font-heading`), settled at plan time by `normalizeImportedTokens` together with the colour slugs (both kinds share one CSS namespace, so neither takes the other's name): references and declarations of a renamed name are rewritten, and two names that normalise to the same variable both survive. Committed via `tx.addFontTokens` after fonts so matching imported families can be assigned. A `--font-*` that collides with an existing font token surfaces as a `TokenConflict` (rename / skip / overwrite) |
+| **Scripts** | Executable inline scripts and JS files linked by imported HTML | Ordered so every page's document order holds at once (see `priority` above) and committed via `tx.addScripts` with page scope from the source HTML. Classic scripts remain plain `<script>` assets and bypass bundling; `type="module"` scripts keep module semantics. Module imports from known npm CDNs (`esm.sh`, `esm.run`, `unpkg`, jsDelivr npm URLs) are rewritten to bare package specifiers and recorded as runtime dependencies, so `https://esm.sh/@motion.page/sdk@1.2.4` becomes `@motion.page/sdk` plus `@motion.page/sdk: 1.2.4` in `packageJson.dependencies`. Non-executable script data such as `application/json`, import maps, and templates is skipped. |
 | **Stylesheets (kept)** | Top-level linked sheets the user opted into `mode: 'file'` | Flattened `@import` graph, Google imports stripped, `url()` normalised; committed via `tx.addStylesheets` as a `SiteFile` (`type: 'style'`) + `site.runtime.styles` entry scoped to the linking pages. Editable afterwards in the Site panel's Styles section and the code editor. |
 
 ---
@@ -264,10 +276,18 @@ Class-free ambient selectors and supported raw blocks such as `@keyframes`
 remain conservative and global. This retains framework cascades such as `.row`
 plus `.row > *` without shipping thousands of unused utilities.
 
-Runtime code that constructs class names dynamically cannot be inferred from a
-static page tree. Those classes must be assigned in the editor (including to a
-hidden structural node) or the stylesheet should use `mode:'file'`, which is
-the explicit non-tree-shaken escape hatch for runtime-owned CSS.
+A class that only exists at runtime — a modifier a script toggles, such as
+`.nav--open` — is never assigned to a node, so node class ids alone would
+prune it. `collectUsedStyleRuleIds` therefore also keeps every class whose
+name appears literally in a `type: 'script'` site file: the script source is
+split on every character a class name cannot contain, and a class rule whose
+name is among the surviving runs counts as used. This over-collects on purpose
+(`add`, `length` and every other identifier in the script also land in the
+set) — a false positive costs a few bytes of CSS, a false negative drops a rule
+that is correct everywhere until publish. Only literal names are seen: a class
+built by concatenation at runtime still cannot be inferred and must be assigned
+in the editor (including to a hidden structural node) or shipped in a
+`mode:'file'` stylesheet, the explicit non-tree-shaken escape hatch.
 
 The escape hatch for "this sheet's resets/styles must not leak into other pages at all" is no longer a generated scope class — it is keeping that sheet as a file (`mode: 'file'`), page-scoped via runtime config.
 
@@ -279,7 +299,7 @@ The escape hatch for "this sheet's resets/styles must not leak into other pages 
 
 - **`PageConflict`** — a desired slug collides with an existing page slug or with another slug in the same import batch.
 - **`RuleConflict`** — a `kind:'class'` rule's name collides with an existing class name. Ambient rules never conflict. One row per name even when the name arrives as several cascade fragments (they rename together).
-- **`TokenConflict`** — a design-token CSS custom property collides with an existing token. One type covers both colour tokens (keyed by `--<slug>`, against `framework.colors.tokens`) and font tokens (keyed by `--font-*`, against `fonts.tokens`), since both are just a `--var` contract referenced by `var(--x)` in the imported CSS. Imported tokens are deduped per kind upstream, so only site-vs-import collisions occur.
+- **`TokenConflict`** — a design-token CSS custom property collides with an existing token. One type covers both colour tokens (keyed by `--<slug>`, against `framework.colors.tokens`) and font tokens (keyed by `--font-*`, against `fonts.tokens`), since both are just a `--var` contract referenced by `var(--x)` in the imported CSS. Imported tokens are deduped per kind upstream, so only site-vs-import collisions occur. A rename target also skips the import's other token names and every custom property the imported CSS declares, so a renamed token never lands on a variable that is already in use. Token conflicts default to auto-rename, with one exception: when the existing font token is an untouched seeded role token (`font-heading`, `font-body` or `font-mono` with its seeded name and fallback and no bound family, checked by `isUntouchedFontRoleToken` in `src/core/fonts/roles.ts`), the default is overwrite. The imported family and fallback land on the role token and imported rules keep `var(--font-body)`, so importing into a new site behaves as if the token were absent. A role token the user has edited keeps the rename default.
 - **`CrossSheetClassConflict`** — two imported page cascades define the same class differently (see "Cross-sheet class conflicts" above). Keyed by `(desiredName, definitionId)`; resolutions apply FIRST in `applyConflictResolutions` so a renamed definition no longer participates in the site-vs-import conflict on the original name.
 
 Page slugs can be slash-delimited public paths. Root `index.html` stays the homepage slug `index`; nested `index.html` files use their directory route, so `documentation/index.html` imports as `/documentation` and does not collide with `download-version/index.html`.
@@ -302,11 +322,21 @@ The conflict wizard renders bulk controls in each of the three conflict categori
 
 ---
 
+## Re-importing a site
+
+Running the wizard twice on the same bundle is a no-op for its ambient rules: each arrives again and replaces itself rather than stacking a second copy (class rules still pass through the Conflicts step, see below). Every rule parsed from a stylesheet carries `origin: { source, ordinal }` (stamped in `buildAssetPlan`, persisted on the committed `StyleRule`). At commit, `tx.putStyleRule` asks the store for the rule with the same origin **and** the same selector (`findReimportedStyleRule`, `importLinking.ts`); when one exists it is overwritten in place — id and cascade `order` kept, declarations replaced — otherwise the rule is added. Both conditions are needed: a stylesheet that gained a rule shifts every later ordinal (those must arrive as new rules, not overwrite unrelated ones), and a selector alone would let a theme's `body {}` replace a user-authored `body {}` or collapse a sheet that legitimately declares one selector twice.
+
+Class rules still pass through `RuleConflict` first (the registry's unique-name invariant), so a re-imported class lands under the user's chosen resolution. Ambient rules never conflict and rely on the origin match alone. The single-fragment paste path (`insertImportedNodes` → `mergeImportedStyleRules`) uses the same `findReimportedStyleRule`; pasted `<style>` CSS has no origin, so there it falls back to skipping an ambient selector that already exists.
+
+Pages are not reconciled this way: a second import of `about.html` is a slug conflict with the usual rename / overwrite / skip choice.
+
+---
+
 ## Atomicity
 
 | Phase | Guarantee |
 |---|---|
-| Asset uploads (Step A) | Network, not reversible. Per-asset failures are caught, recorded as `asset-upload-failed` warnings, and the import continues. Orphaned uploads are harmless — left in the media library for manual cleanup. |
+| Asset uploads (Step A) | Network, not reversible. Per-asset failures are caught, recorded as `asset-upload-failed` warnings, and the import continues. Folder placement after a successful upload is best-effort: it can only add an `asset-folder-failed` warning, never fail the asset. Orphaned uploads are harmless — left in the media library for manual cleanup. |
 | Store mutation (Step C) | Single `adapter.commit` call. The admin adapter wraps it in one `mutateAllPagesAndSite` call — one patch-based undo entry. Cmd+Z reverts pages, style rules, stylesheet files, fonts, color tokens, and scripts together in one step. |
 
 ---
@@ -332,9 +362,9 @@ The modal is mounted once at the authenticated admin shell (`AuthenticatedAdmin.
 
 **Conflicts** — shown only when conflicts exist. Static imports resolve page slugs, class names, design tokens, and cross-sheet classes. CMS bundle imports resolve row slug collisions reported by `/admin/api/cms/import/preview`; the default action renames the incoming row to the server-provided next slug, but users can skip or custom-rename each row before import. Those decisions travel as `selection.rowSlugOverrides` to the archive endpoint while the browser still uploads the original ZIP unchanged.
 
-**Import** (`ImportStep`) — a calm, determinate progress surface (no terminal log). A headline activity (phase verb + N of M), a determinate bar with a travelling shimmer, a one-line current-item ticker, and a per-category breakdown mirroring the Review navigator (pending ring → spinner → mint check, with a tint-washed progress fill). Static imports are driven by real pipeline state: media (asset uploads) is the only incremental phase, so it dominates the bar; the other categories land together at the atomic commit. CMS bundle imports show the same surface with CMS-native categories (site, rows, media, folders, redirects) while the server streams the archive. The commit phase is uncancellable; the upload phase is cancellable (orphaned uploads are harmless).
+**Import** (`ImportStep`) — a calm, determinate progress surface (no terminal log). A headline activity (phase verb + N of M), a determinate bar with a travelling shimmer, a one-line current-item ticker, and a per-category breakdown mirroring the Review navigator (pending ring → spinner → mint check, with a tint-washed progress fill). Static imports are driven by real pipeline state: media (asset uploads) is the only incremental phase, so it dominates the bar; the other categories land together at the atomic commit. CMS bundle imports show the same surface with CMS-native categories (site, rows, media, folders, redirects) while the server streams the archive. The commit phase is uncancellable; the upload phase is genuinely cancellable — Cancel (or closing the dialog) aborts the run's `AbortSignal`, which stops queued uploads, aborts the in-flight one, and prevents `adapter.commit` and the draft save. A toast reports how many files had already uploaded; those stay in the Media Library.
 
-On success the same step switches to its **complete** state — a success mark, an "Imported into &lt;site&gt;" summary, and every category shown as done. Footer actions: **View import log** (reveals per-category counts + warnings) and **Open site →** (jumps to the first imported page). On failure it shows an inline error surface, and the failure is also surfaced via toast.
+On success the same step switches to its **complete** state — a success mark, an "Imported into &lt;site&gt;" summary, and every category shown as done. The media count keeps its **planned** total (`makeStaticRunDoneProgress(plan, result)`): a run that set out to upload 30 files and managed 22 shows `22 / 30` with a warning mark, a "8 of 30 media files failed to upload" line, and a `warning` toast instead of a success one. Whenever the run needs attention (`importNeedsAttention`: a media shortfall, or any rank-0 warning such as `unresolved-asset` / `missing-stylesheet` / `script-order-conflict`) the import log opens by itself so the affected paths are on screen without a click. Footer actions: **View import log** / **Hide import log** (per-category counts + warnings) and **Open site →** (jumps to the first imported page). On failure it shows an inline error surface, and the failure is also surfaced via toast.
 
 ---
 
@@ -346,10 +376,43 @@ On success the same step switches to its **complete** state — a success mark, 
 | `unmatched-media-query` | Legacy warning kind retained for old import reports; current imports preserve unmatched `@media` blocks as reusable conditions |
 | `invalid-rule` | A CSS rule caused `replaceSync` to throw (sheet-level parse error) |
 | `blocked-property` | A CSS property name is on the security denylist (`behavior`, `-moz-binding`, …) — declaration dropped |
-| `duplicate-class` | Two `.foo {}` rules in the same file; later declarations win |
-| `missing-stylesheet` | A `<link rel="stylesheet">` href was not found in the FileMap |
+| `duplicate-class` | Two `.foo {}` rules in the same file; both stay separate rules in source order, so the later one still cascades after anything between them (the repeat becomes an ambient fragment at commit) |
+| `missing-stylesheet` | A `<link rel="stylesheet">` href was not found in the FileMap (a cache-busting `?v=…` query is stripped before the lookup, so it is not a cause) |
 | `asset-upload-failed` | An individual asset upload was rejected by the server; the original FileMap path remains in the import |
+| `asset-folder-failed` | The asset uploaded and its URL was rewritten, but filing it under the folder mirroring its bundle path failed; it sits at the media root |
+| `script-order-conflict` | Two pages link the same scripts in contradictory orders; the order from the page that links them first wins |
 | `external-font` | An `@font-face` with no bundled file (all `src` entries are external URLs) — skipped |
+| `unresolved-asset` | An HTML/CSS reference to a media file the archive does not contain under that path — one warning per distinct path |
+
+### Cache-busted URLs
+
+Reference resolution strips any query string or fragment before looking a path up in the FileMap:
+`assets/site.css?v=8f3a1c` and `assets/site.css` address the same file. This applies to
+`<link rel="stylesheet">`, `<script src>`, CSS `@import`, CSS `url()`, and node `src` / `href` / `srcset` / `videoUrl` / `poster` —
+static site generators commonly emit a content hash on all of them.
+
+The original URL is preserved for the in-place CSS rewrite; only the lookup is affected.
+
+The import log shows the first 12 warnings, ordered so the kinds that name a
+missing file come first and the CSS interpretation notes last
+(`rankWarning` in `importProgress.ts`).
+
+### Filename matching
+
+Asset references resolve by exact FileMap key first. On a miss, the path is
+compared punctuation-insensitively (lowercased, with everything but letters,
+digits, `.` and `/` removed) against every file in the archive. This exists
+because exporters do not always agree with themselves: a Webflow export stores
+`101-&Berlin-Office-Us+ Coworking.webp` and references it from the HTML as
+`101-Berlin-Office-Us-Coworking.webp`, so an exact-only match imports the page
+with a broken image.
+
+The fallback match must be **unique**. Two files that differ only in
+punctuation are two different files, and picking one would put the wrong image
+on the page — so ambiguity falls through to the same `unresolved-asset`
+warning as genuine absence. Only references whose extension maps to an
+uploadable media MIME are reported: anchors to extensionless routes and pages
+outside the archive are normal and would bury the real misses.
 
 ---
 

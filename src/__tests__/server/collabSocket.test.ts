@@ -3,11 +3,14 @@
  * the co-editing WebSocket. The full two-client convergence round-trip runs
  * in collabRelayIntegration.test.ts against a real Bun.serve.
  */
+import { getSessionHash } from '../../../server/auth/authz'
 import { afterEach, describe, expect, it } from 'bun:test'
+import * as encoding from 'lib0/encoding'
 import { SITE_SOCKET_PATH } from '@core/collab'
 import { createCollabRelay, type CollabRelay } from '../../../server/collab/relay'
 import {
   handleCollabSocketUpgrade,
+  reviewAwarenessUpdate,
   type CollabSocketData,
 } from '../../../server/collab/socket'
 import {
@@ -73,15 +76,13 @@ describe('collab socket — upgrade gating', () => {
     expect(server.data()).toBeNull()
   })
 
-  it('upgrades an authenticated same-origin handshake with fullSiteWriter resolved from capabilities', async () => {
+  it('binds authenticated writer and reader handshakes to the original session', async () => {
     const { harness, cookie } = await setup()
     const server = fakeServer(true)
     expect(await handleCollabSocketUpgrade(socketRequest({ cookie }), harness.db, server)).toBeNull()
-    // The owner holds every site-write cap, so it skips the per-update guard.
-    expect(server.data()?.fullSiteWriter).toBe(true)
+    expect(server.data()?.sessionHash).toBe(await getSessionHash(socketRequest({ cookie })))
 
-    // A partial writer (one category) is NOT a full writer — its frames run
-    // through the guard, same path a read-only viewer takes.
+    // Partial writers and readers use the same session-bound transport.
     const contentOnly = await harness.createRoleUser({
       name: 'Content Only',
       slug: 'site-content-only',
@@ -95,7 +96,7 @@ describe('collab socket — upgrade gating', () => {
         contentServer,
       ),
     ).toBeNull()
-    expect(contentServer.data()?.fullSiteWriter).toBe(false)
+    expect(contentServer.data()?.sessionHash).toBe(await getSessionHash(socketRequest({ cookie: contentOnly.cookie })))
 
     const readOnly = await harness.createRoleUser({
       name: 'Site Viewer',
@@ -110,12 +111,90 @@ describe('collab socket — upgrade gating', () => {
         readOnlyServer,
       ),
     ).toBeNull()
-    expect(readOnlyServer.data()?.fullSiteWriter).toBe(false)
+    expect(readOnlyServer.data()?.sessionHash).toBe(await getSessionHash(socketRequest({ cookie: readOnly.cookie })))
+  })
+
+  // "Your name" is optional: without a display name the session identity (the
+  // only presence name the relay forwards) must still be non-empty and match
+  // what the editor publishes (userDisplayLabel) — otherwise that admin's
+  // presence never reaches anyone.
+  it('names an admin without a display name by email in the presence identity', async () => {
+    const { harness } = await setup()
+    const nameless = await harness.createRoleUser({
+      name: 'Nameless',
+      slug: 'site-nameless',
+      displayName: '',
+      capabilities: ['site.read'],
+    })
+    const server = fakeServer(true)
+    expect(await handleCollabSocketUpgrade(socketRequest({ cookie: nameless.cookie }), harness.db, server)).toBeNull()
+    expect(server.data()?.identity.name).toBe(nameless.email)
   })
 
   it('returns 426 when the request is not an upgradable WebSocket handshake', async () => {
     const { harness, cookie } = await setup()
     const res = await handleCollabSocketUpgrade(socketRequest({ cookie }), harness.db, fakeServer(false))
     expect(res?.status).toBe(426)
+  })
+})
+
+describe('collab socket — awareness review', () => {
+  const identity = {
+    id: 'admin-1',
+    name: 'Admin One',
+    avatarUrl: null,
+    gravatarHash: 'hash-1',
+  }
+
+  /** Wire-shape an awareness update: varUint count, then per client varUint id, varUint clock, varString stateJSON. */
+  function awarenessUpdate(entries: Array<{ clientId: number; state: unknown }>): Uint8Array {
+    const enc = encoding.createEncoder()
+    encoding.writeVarUint(enc, entries.length)
+    for (const entry of entries) {
+      encoding.writeVarUint(enc, entry.clientId)
+      encoding.writeVarUint(enc, 1)
+      encoding.writeVarString(enc, JSON.stringify(entry.state))
+    }
+    return encoding.toUint8Array(enc)
+  }
+
+  const data = () => ({ identity, awarenessClients: new Set<number>([42]) })
+
+  it('accepts the connection owner’s own presence', () => {
+    const update = awarenessUpdate([{ clientId: 7, state: { user: identity, docId: null } }])
+    expect(reviewAwarenessUpdate(update, data())).toBeNull()
+  })
+
+  it('accepts the y-protocols default empty state a fresh client announces', () => {
+    // Regression: every Awareness starts with local state {} and broadcasts
+    // it on connect before real presence is published — that is protocol
+    // chatter, not a malformed frame.
+    const update = awarenessUpdate([{ clientId: 7, state: {} }])
+    expect(reviewAwarenessUpdate(update, data())).toBeNull()
+  })
+
+  it('refuses a non-empty state without a user block as malformed', () => {
+    const update = awarenessUpdate([{ clientId: 7, state: { pointer: { x: 1, y: 2 } } }])
+    expect(reviewAwarenessUpdate(update, data())).toBe('malformed')
+  })
+
+  it('refuses an undecodable payload as malformed', () => {
+    expect(reviewAwarenessUpdate(new Uint8Array([255, 255, 255]), data())).toBe('malformed')
+  })
+
+  it('refuses presence under another admin’s identity as impersonation', () => {
+    const forged = { ...identity, name: 'Someone Else' }
+    const update = awarenessUpdate([{ clientId: 7, state: { user: forged } }])
+    expect(reviewAwarenessUpdate(update, data())).toBe('impersonation')
+  })
+
+  it('refuses clearing a clientID this connection never announced', () => {
+    const update = awarenessUpdate([{ clientId: 999, state: null }])
+    expect(reviewAwarenessUpdate(update, data())).toBe('foreignClear')
+  })
+
+  it('allows clearing a clientID this connection contributed', () => {
+    const update = awarenessUpdate([{ clientId: 42, state: null }])
+    expect(reviewAwarenessUpdate(update, data())).toBeNull()
   })
 })

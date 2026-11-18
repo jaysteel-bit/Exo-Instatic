@@ -5,7 +5,8 @@
  * ## The problem
  *
  * A declaration whose value contains `var()`/`env()` cannot be expanded at
- * parse time, and engines disagree about what their CSSOM then exposes:
+ * parse time. Headless CSSOM also drops valid `clamp()`, `min()`, and `max()`
+ * declarations. Engines disagree about what their CSSOM exposes:
  *
  * - **Chromium** stores a "pending-substitution value": `style.length`
  *   enumerates the shorthand's longhands, but `getPropertyValue(longhand)`
@@ -30,7 +31,8 @@
  *   `border-left: 1px solid var(--rule)`
  *     → `--instatic-sub-border-left: 1px solid var(--rule)`
  *
- * and decoded back to its real property after the engine parse
+ * WebKit-prefixed declarations use the same encoding because Happy DOM drops
+ * them when compiling plugin layouts. Both are decoded after the engine parse
  * (`decodeSubstitutionProperty`). The output is identical across engines BY
  * CONSTRUCTION — no per-engine recovery paths.
  *
@@ -44,8 +46,8 @@ import type { CSSDeclarationPriorityBag } from '@core/page-tree'
 /** Prefix for encoded substitution declarations. */
 export const SUBSTITUTION_PROP_MARKER = '--instatic-sub-'
 
-/** A value that contains a `var(` or `env(` substitution function. */
-export const SUBSTITUTION_FN_RE = /\b(?:var|env)\(/
+/** CSS functions whose declarations must survive differing CSSOM implementations. */
+const SUBSTITUTION_FN_RE = /\b(?:var|env|clamp|min|max)\(/i
 
 /** At-rule blocks whose contents must pass through unencoded. */
 const SKIPPED_AT_RULES = new Set(['keyframes', 'font-face'])
@@ -54,7 +56,7 @@ const SKIPPED_AT_RULES = new Set(['keyframes', 'font-face'])
 const PLAIN_PROPERTY_RE = /^-?[a-zA-Z][a-zA-Z-]*$/
 
 /**
- * Encode every substitution declaration in a full stylesheet. Everything else
+ * Encode substitution and WebKit declarations in a full stylesheet. Everything else
  * is copied byte-for-byte (comments, whitespace, selectors, at-rules).
  */
 export function encodeSubstitutionDeclarations(css: string): string {
@@ -157,15 +159,16 @@ export function decodeSubstitutionProperty(kebab: string): string | null {
 
 /**
  * Rewrite one `prop: value` chunk to its marker form when the value uses a
- * substitution function. Custom properties and anything that doesn't parse as
- * a plain declaration pass through verbatim.
+ * substitution function or the property has a WebKit prefix. Custom properties
+ * and anything that doesn't parse as a plain declaration pass through verbatim.
  */
 function encodeDeclarationChunk(chunk: string): string {
   const colon = chunk.indexOf(':')
   if (colon === -1) return chunk
   const prop = chunk.slice(0, colon).trim()
   const value = chunk.slice(colon + 1)
-  if (!PLAIN_PROPERTY_RE.test(prop) || !SUBSTITUTION_FN_RE.test(value)) return chunk
+  if (!PLAIN_PROPERTY_RE.test(prop)) return chunk
+  if (!SUBSTITUTION_FN_RE.test(value) && !/^-webkit-/i.test(prop)) return chunk
   const leading = chunk.slice(0, chunk.length - chunk.trimStart().length)
   return `${leading}${SUBSTITUTION_PROP_MARKER}${prop}:${value}`
 }
@@ -231,6 +234,25 @@ export interface CssDeclarationBlock {
 }
 
 /**
+ * Repair a longhand expanded from a shorthand.
+ *
+ * `background: none` and `border: none` are everyday CSS, but expansion can
+ * put `none` into colour longhands such as `background-color` and
+ * `border-top-color`. No colour property accepts `none`, so the browser drops
+ * that declaration and the reset stops resetting.
+ *
+ * `initial` supplies the intended initial value in both cases: `transparent`
+ * for a background and `currentcolor` for a border.
+ * This intentionally also repairs an author-typed invalid colour longhand;
+ * otherwise the browser would drop it and could preserve an earlier value.
+ */
+function repairExpandedShorthandValue(camel: string, value: string): string {
+  if (camel.startsWith('--')) return value
+  if (!camel.endsWith('Color')) return value
+  return value.trim().toLowerCase() === 'none' ? 'initial' : value
+}
+
+/**
  * Walk a parsed `CSSStyleDeclaration` into a camelCase property bag:
  * decodes substitution markers back to their real property
  * (`decodeSubstitutionProperty`), converts kebab-case names to the camelCase
@@ -262,7 +284,7 @@ export function readCssDeclarationBlock(
       onBlockedProperty?.(camel, kebab)
       continue
     }
-    styles[camel] = value
+    styles[camel] = repairExpandedShorthandValue(camel, value)
     if (style.getPropertyPriority(rawKebab).toLowerCase() === 'important') {
       priorities[camel] = 'important'
     }

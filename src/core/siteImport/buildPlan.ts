@@ -24,9 +24,12 @@ import { makeHtmlPagePlan } from './htmlPagePlan'
 import { buildAssetPlan, type CssFileResult } from './assetPlan'
 import { partitionLinkedStylesheets } from './stylesheetPlan'
 import { detectCrossSheetClassConflicts } from './classCascades'
-import { detectConflicts } from './conflicts'
+import { detectConflicts, rewriteImportVarRefs } from './conflicts'
+import { declaredCustomProperties } from './varRefs'
+import { normalizeImportedTokens } from './tokenNames'
 import { createCssPlanState, parseCssSourceIntoPlan } from './planCss'
 import { rewriteNpmCdnModuleImports } from './scriptDependencies'
+import { mergeScriptOrder, type PageScriptSequence } from './scriptOrder'
 import type {
   ClassifiedFile,
   FileMap,
@@ -165,26 +168,38 @@ export function buildImportPlan({ fileMap, currentSite, options }: BuildImportPl
     buildAssetPlan(rawPagePlans, publishableCssFileResults, fileMap, rawStylesheetSources)
   warnings.push(...assetWarnings)
 
+  // 5b. Colour and font tokens are emitted under their normalised name
+  //     (`--brand---neutral--700` → `--brand-neutral-700`, `--font-Heading` →
+  //     `--font-heading`). Settle those names now and rewrite the imported
+  //     `var()` references to match, so the conflict step and the commit both
+  //     see the name that is emitted. Both kinds share one CSS namespace and
+  //     are settled together.
+  const { colors, fonts: fontTokens, renames } = normalizeImportedTokens(
+    { colors: [...cssPlan.colorsBySlug.values()], fonts: [...cssPlan.fontTokensByVariable.values()] },
+    declaredCustomProperties(normalizedPagePlans, normalizedStyleRules),
+  )
+  const { pages, styleRules } = rewriteImportVarRefs(normalizedPagePlans, normalizedStyleRules, renames)
+
   // 6. Detect conflicts against the current site — pages, class rules, and
   //    design tokens (colour + font) all flow through one resolution model.
   const conflicts = detectConflicts(
     currentSite,
-    normalizedPagePlans,
-    normalizedStyleRules,
-    [...cssPlan.colorsBySlug.values()],
-    [...cssPlan.fontTokensByVariable.values()],
+    pages,
+    styleRules,
+    colors,
+    fontTokens,
   )
 
   return {
-    pages: normalizedPagePlans,
-    styleRules: normalizedStyleRules,
+    pages,
+    styleRules,
     styleRuleSources,
     fonts,
     googleFonts: [...googleFontsByFamily.values()],
     conditions: [...cssPlan.conditionsById.values()],
     assets,
-    colors: [...cssPlan.colorsBySlug.values()],
-    fontTokens: [...cssPlan.fontTokensByVariable.values()],
+    colors,
+    fontTokens,
     scripts,
     linkedStylesheets,
     stylesheets,
@@ -207,19 +222,18 @@ interface HtmlPhaseResult {
   warnings: ImportWarning[]
 }
 
+/** Priorities start here so hand-added scripts (default 100) sort alongside imported ones. */
+const FIRST_SCRIPT_PRIORITY = 100
+
 function collectHtmlPagePlans(classified: ClassifiedFile[], fileMap: FileMap): HtmlPhaseResult {
   const warnings: ImportWarning[] = []
   const rawPagePlans: PagePlan[] = []
   const inlineCssByPage = new Map<string, string>()
-  const scriptsByPath = new Map<string, {
-    path: string
-    content: string
-    format: ImportScript['format']
-    dependencies: ImportScript['dependencies']
+  const scriptsByPath = new Map<string, Omit<ImportScript, 'pageSources' | 'priority'> & {
     pageSources: Set<string>
-    priority: number
   }>()
-  let nextScriptPriority = 100
+  // Each page's scripts in document order; merged into one load order below.
+  const sequences: PageScriptSequence[] = []
 
   for (const f of classified) {
     if (f.role !== 'html') continue
@@ -228,11 +242,14 @@ function collectHtmlPagePlans(classified: ClassifiedFile[], fileMap: FileMap): H
     warnings.push(...pageWarnings)
     rawPagePlans.push(pagePlan)
     if (inlineCss.trim().length > 0) inlineCssByPage.set(pagePlan.source, inlineCss)
+
+    const sequence: string[] = []
     for (const pageScript of pagePlan.scripts) {
       const scriptPath = pageScript.path
       const existing = scriptsByPath.get(scriptPath)
       if (existing) {
         existing.pageSources.add(pagePlan.source)
+        if (!sequence.includes(scriptPath)) sequence.push(scriptPath)
         continue
       }
 
@@ -248,16 +265,25 @@ function collectHtmlPagePlans(classified: ClassifiedFile[], fileMap: FileMap): H
         format: pageScript.format,
         dependencies: script.dependencies,
         pageSources: new Set([pagePlan.source]),
-        priority: nextScriptPriority,
       })
-      nextScriptPriority += 1
+      sequence.push(scriptPath)
     }
+    sequences.push({ source: pagePlan.source, paths: sequence })
   }
 
-  const scripts: ImportScript[] = [...scriptsByPath.values()].map((script) => ({
-    ...script,
-    pageSources: [...script.pageSources],
-  }))
+  // One `priority` per script has to honour every page's document order at
+  // once — a per-file counter that numbers a script on first sight cannot,
+  // once two pages share a file (#403).
+  const merged = mergeScriptOrder(sequences)
+  warnings.push(...merged.warnings)
+  const scripts: ImportScript[] = merged.order.map((path, index) => {
+    const script = scriptsByPath.get(path)!
+    return {
+      ...script,
+      pageSources: [...script.pageSources],
+      priority: FIRST_SCRIPT_PRIORITY + index,
+    }
+  })
   return { rawPagePlans, inlineCssByPage, scripts, warnings }
 }
 

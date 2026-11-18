@@ -16,12 +16,14 @@ import {
   uploadCurrentUserAvatar,
   type CmsCurrentUser,
 } from '@core/persistence'
+import { isValidEmail } from '@core/utils/email'
 import { useAdminSessionSetter } from '@admin/sessionContext'
 import { useStepUp } from '@admin/shared/StepUp'
 import { UserAvatar } from '@admin/shared/UserAvatar'
 import styles from '../AccountPage.module.css'
 import { getErrorMessage } from '@core/utils/errorMessage'
 import { isStepUpCancelled } from './securityErrors'
+import { userDisplayLabel } from '@core/users/displayName'
 
 interface ProfileTabProps {
   user: CmsCurrentUser
@@ -85,7 +87,7 @@ export function ProfileTab({ user }: ProfileTabProps) {
   const displayNameId = useId()
   const emailId = useId()
 
-  const displayName = user.displayName.trim() || user.email
+  const displayName = userDisplayLabel(user)
   const hasUploadedAvatar = user.avatarUrl !== null
   const profileDirty =
     profileForm.displayName.trim() !== user.displayName ||
@@ -120,7 +122,7 @@ export function ProfileTab({ user }: ProfileTabProps) {
     if (busy) return
 
     const email = profileForm.email.trim()
-    if (!email.includes('@')) {
+    if (!isValidEmail(email)) {
       setStatus({ tone: 'error', message: 'Enter a valid email address.' })
       return
     }

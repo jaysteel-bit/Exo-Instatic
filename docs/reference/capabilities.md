@@ -8,7 +8,7 @@ For the broader auth flow (sessions, MFA, step-up), see [docs/features/auth-and-
 
 ## TL;DR
 
-- Defined as a `const` array in `src/core/capabilities.ts` (`@core/capabilities`); `CoreCapability` is derived via `typeof CORE_CAPABILITIES[number]`. **38 capabilities.**
+- Defined as a `const` array in `src/core/capabilities.ts` (`@core/capabilities`); `CoreCapability` is derived via `typeof CORE_CAPABILITIES[number]`. **40 capabilities.**
 - Handlers gate on capability, not on role: `requireCapability(req, db, 'site.read')`.
 - The **Owner AND Admin** roles get their capability lists force-resynced from `SYSTEM_ROLES` on every server boot. Hand-edits to either built-in role through the admin UI are restored at next boot — they are code-level decisions, not runtime ones.
 - Adding a capability: append the literal to `CORE_CAPABILITIES` in `src/core/capabilities.ts` (one place — server imports it), add it to the relevant `SYSTEM_ROLES` entries, wire `requireCapability(...)` at the gate point, and add picker meta + groups for the role-edit dialog. The two architecture tests (`capability-picker-coverage.test.ts`, `cms-handlers-capability-gated.test.ts`) catch missing pieces.
@@ -16,13 +16,13 @@ For the broader auth flow (sessions, MFA, step-up), see [docs/features/auth-and-
 
 ---
 
-## The 38 core capabilities
+## The 40 core capabilities
 
 ### Read
 
 | Capability         | Grants                                                              | Roles            |
 |--------------------|---------------------------------------------------------------------|------------------|
-| `dashboard.read`   | Open the Dashboard workspace                                        | Owner, Admin, Client |
+| `dashboard.read`   | Open the Dashboard workspace and read its capability-filtered widgets                                        | Owner, Admin, Client |
 | `site.read`        | Open the Site workspace; view pages, VCs, classes. Also gates `/runtime/preview` (preview HTML rendering of the posted draft). | Owner, Admin, Client |
 
 ### Site editing (three-way split)
@@ -32,6 +32,8 @@ For the broader auth flow (sessions, MFA, step-up), see [docs/features/auth-and-
 | `site.structure.edit`    | Add / remove / move / rename nodes; manage pages, VCs, classes      | Owner, Admin  |
 | `site.content.edit`      | Modify content props (text, image src/alt, link href) on existing nodes — no structure or style edits | Owner, Admin, Client |
 | `site.style.edit`        | Modify CSS classes, style overrides, breakpoints, framework tokens  | Owner, Admin  |
+| `site.branches.create`   | Fork a branch; rename, delete, update from main, and share or revoke a preview link for branches you forked (see [`features/branches.md`](../features/branches.md)) | Owner, Admin  |
+| `site.branches.manage`   | Every branch action on any branch, plus merge into main and decline a merge request. Does not fork on its own. | Owner, Admin  |
 
 `SITE_WRITE_CAPABILITIES` is the convenience set `['site.structure.edit', 'site.content.edit', 'site.style.edit']` — defined locally in `server/handlers/cms/siteDocument.ts` and `src/admin/access.ts` at each point of use, not in a shared capabilities module. The transactional site-document save (`PUT /admin/api/cms/site-document`) accepts any site writer, then diff-validates the batch by category: page deletions, page metadata, topology, module identity, non-content props, and dynamic bindings require `site.structure.edit`; content-category props (and site-wide SEO copy on the shell) require `site.content.edit`; inline styles/classes/breakpoint overrides and style rules require `site.style.edit`. Empty change sets are no-op saves any site writer may perform, but changed/deleted components and layouts remain structural work (`site.structure.edit`).
 
@@ -97,7 +99,7 @@ Was a single `runtime.manage`. Split because adapter election (bytes go to a plu
 | Capability             | Grants                                                              | Roles         |
 |------------------------|---------------------------------------------------------------------|---------------|
 | `runtime.dependencies` | Edit site `package.json` dependencies; trigger `POST /runtime/dependencies/resolve`. | Owner, Admin |
-| `storage.elect`        | Elect a media storage adapter per asset role (originals / variants / avatars / fonts); elect/clear the variant delegate; verify adapter credentials. | Owner, Admin |
+| `storage.elect`        | Read dashboard storage usage; elect a media storage adapter per asset role (originals / variants / avatars / fonts); elect/clear the variant delegate; verify adapter credentials. | Owner, Admin |
 | `storage.migrate`      | Run the migration SSE that moves bytes between adapters after an election change. | Owner, Admin |
 
 ### Plugins (granular split)
@@ -119,6 +121,11 @@ Was a single `plugins.manage`. Split per the four very different blast radii: re
 | `roles.manage`   | Create, edit, delete custom roles; assign capabilities to roles     | **Owner only.** Admin does not get this. |
 
 `roles.manage` is **owner-only by design** — only the installation owner edits capability grants. Admins manage everything else but can't grant themselves new capabilities.
+
+Role assignment is also bounded by delegation: a `users.manage` actor may
+assign only roles whose complete capability set is already held by that actor.
+This applies to both creating users and changing an existing user's role.
+`roles.manage` cannot be stored on any non-Owner role.
 
 ### Audit
 
@@ -145,8 +152,8 @@ Four built-in `SYSTEM_ROLES`:
 
 | Role     | id        | Capabilities                                                                 | Boot behaviour |
 |----------|-----------|------------------------------------------------------------------------------|----------------|
-| Owner    | `owner`   | All 36 (`CORE_CAPABILITIES`)                                                 | Force-resynced on every boot. Owner-only `roles.manage`. |
-| Admin    | `admin`   | All 36 except `roles.manage`                                                 | **Force-resynced on every boot** (changed from previous "seeded once"). Hand-edits restored at boot. |
+| Owner    | `owner`   | All 40 (`CORE_CAPABILITIES`)                                                 | Force-resynced on every boot. Owner-only `roles.manage`. |
+| Admin    | `admin`   | All 40 except `roles.manage`                                                 | **Force-resynced on every boot** (changed from previous "seeded once"). Hand-edits restored at boot. |
 | Client   | `client`  | `dashboard.read`, `site.read`, `site.content.edit`, `media.read`, `data.custom.tables.read` | Seeded once; freely editable. Sees custom tables only — never the system tables. |
 | Member   | `member`  | (none)                                                                       | Seeded once; freely editable. |
 

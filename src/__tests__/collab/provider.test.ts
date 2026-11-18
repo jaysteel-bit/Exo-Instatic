@@ -13,9 +13,11 @@ import {
   decodeCollabFrame,
   encodeCollabFrame,
   FRAME_PING,
+  FRAME_PONG,
   FRAME_RESET,
   FRAME_SYNC,
   LOCAL_ORIGIN,
+  PRESENCE_DOC_ID,
 } from '@core/collab'
 import {
   createCollabProvider,
@@ -43,6 +45,13 @@ class FakeSocket implements CollabSocketLike {
   emit(frame: Uint8Array): void {
     this.onmessage?.({ data: frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength) })
   }
+}
+
+/** A server step2 for an empty doc — the reply to the client's step1. */
+function emptyStep2(): Uint8Array {
+  const encoder = encoding.createEncoder()
+  syncProtocol.writeSyncStep2(encoder, new Y.Doc())
+  return encoding.toUint8Array(encoder)
 }
 
 function lastSyncMessageType(socket: FakeSocket, docId: string): number | null {
@@ -77,11 +86,12 @@ describe('collab provider', () => {
     provider.destroy()
   })
 
-  it('sends an update frame immediately on a local transaction; remote-applied updates do not echo', () => {
+  it('sends an update frame immediately on a local transaction once the lineage is known; remote-applied updates do not echo', () => {
     const socket = new FakeSocket()
     const provider = createCollabProvider({ createSocket: () => socket })
     socket.open()
     const { doc } = provider.bind('page:p1')
+    socket.emit(encodeCollabFrame('page:p1', 'gen-1', FRAME_SYNC, emptyStep2()))
     const sentBefore = socket.sent.length
 
     doc.transact(() => {
@@ -89,6 +99,7 @@ describe('collab provider', () => {
     }, LOCAL_ORIGIN)
     expect(socket.sent.length).toBe(sentBefore + 1)
     expect(lastSyncMessageType(socket, 'page:p1')).toBe(2) // update
+    expect(decodeCollabFrame(socket.sent[socket.sent.length - 1]!).generation).toBe('gen-1')
 
     // A remote update applied by the provider must NOT be re-sent.
     const remote = new Y.Doc()
@@ -99,6 +110,38 @@ describe('collab provider', () => {
     socket.emit(encodeCollabFrame('page:p1', 'gen-1', FRAME_SYNC, encoding.toUint8Array(encoder)))
     expect(doc.getMap('meta').get('title')).toBe('From remote')
     expect(socket.sent.length).toBe(countBeforeRemote)
+    provider.destroy()
+  })
+
+  it('holds local updates until the server names the lineage, then sends them as one update', () => {
+    const socket = new FakeSocket()
+    const provider = createCollabProvider({ createSocket: () => socket })
+    socket.open()
+    const { doc } = provider.bind('page:p1')
+    const sentAfterBind = socket.sent.length
+
+    // Two local transactions inside the bind round trip — a row created and
+    // placed before the server answered step1.
+    doc.transact(() => { doc.getMap('meta').set('title', 'New page') }, LOCAL_ORIGIN)
+    doc.transact(() => { doc.getMap('tree').set('rootNodeId', 'root') }, LOCAL_ORIGIN)
+    expect(socket.sent.length).toBe(sentAfterBind)
+
+    socket.emit(encodeCollabFrame('page:p1', 'gen-1', FRAME_SYNC, emptyStep2()))
+    const frames = socket.sent.slice(sentAfterBind).map((raw) => decodeCollabFrame(raw))
+    const updates = frames.filter((frame) => frame.docId === 'page:p1' && frame.frameType === FRAME_SYNC
+      && decoding.readVarUint(decoding.createDecoder(frame.payload)) === 2)
+    expect(updates).toHaveLength(1)
+    expect(updates[0]!.generation).toBe('gen-1')
+    // Nothing ever went out with an empty lineage.
+    expect(frames.every((frame) => frame.generation === 'gen-1' || frame.frameType !== FRAME_SYNC
+      || decoding.readVarUint(decoding.createDecoder(frame.payload)) !== 2)).toBe(true)
+    // Both changes reached the wire.
+    const mirror = new Y.Doc()
+    const decoder = decoding.createDecoder(updates[0]!.payload)
+    decoding.readVarUint(decoder)
+    Y.applyUpdate(mirror, decoding.readVarUint8Array(decoder))
+    expect(mirror.getMap('meta').get('title')).toBe('New page')
+    expect(mirror.getMap('tree').get('rootNodeId')).toBe('root')
     provider.destroy()
   })
 
@@ -164,6 +207,29 @@ describe('collab provider', () => {
     provider.destroy()
   })
 
+  it('stays connected while its pings keep being answered', async () => {
+    const socket = new FakeSocket()
+    const provider = createCollabProvider({ createSocket: () => socket, pingIntervalMs: 20 })
+    socket.open()
+
+    // Answer every ping with a pong, like the live relay does. The provider
+    // must never conclude "offline" from elapsed time alone — only from a
+    // ping that stayed unanswered (a throttled background webview skips
+    // whole ping intervals, and resuming must not read as a dead socket).
+    const answering = setInterval(() => {
+      const pings = socket.sent.filter((f) => decodeCollabFrame(f).frameType === FRAME_PING)
+      if (pings.length > 0) {
+        socket.emit(encodeCollabFrame(PRESENCE_DOC_ID, '', FRAME_PONG, new Uint8Array()))
+      }
+    }, 10)
+
+    await Bun.sleep(150)
+    clearInterval(answering)
+    expect(provider.status()).toBe('connected')
+    expect(provider.canSend()).toBe(true)
+    provider.destroy()
+  })
+
   it('refuses to send while the socket backlog is not draining', () => {
     const socket = new FakeSocket()
     const provider = createCollabProvider({ createSocket: () => socket, pingIntervalMs: 60_000 })
@@ -194,6 +260,37 @@ describe('collab provider', () => {
     socket.onclose?.()
     provider.reconnectNow()
     expect(created).toBe(2)
+    provider.destroy()
+  })
+
+  it('reopen replaces a live socket at once and resyncs its docs on the new one', () => {
+    const sockets: FakeSocket[] = []
+    const provider = createCollabProvider({
+      createSocket: () => {
+        const socket = new FakeSocket()
+        sockets.push(socket)
+        return socket
+      },
+    })
+    const statuses: string[] = []
+    provider.onStatus((status) => statuses.push(status))
+    sockets[0].open()
+    provider.bind('page:p1')
+
+    provider.reopen()
+
+    // No backoff: the replacement exists before this call returns, and the
+    // socket authenticated by the old cookie is closed with its events cut.
+    expect(sockets.length).toBe(2)
+    expect(sockets[0].readyState).toBe(3)
+    expect(sockets[0].onclose).toBeNull()
+    expect(provider.canSend()).toBe(false)
+
+    sockets[1].open()
+    expect(provider.status()).toBe('connected')
+    expect(lastSyncMessageType(sockets[1], 'page:p1')).toBe(0) // step1 again
+    // The swap never reported an outage.
+    expect(statuses).not.toContain('offline')
     provider.destroy()
   })
 

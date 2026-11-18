@@ -23,6 +23,7 @@ export {
 export { PageSchema } from './page'
 export {
   CSSDeclarationPriorityBagSchema,
+  StyleRuleOriginSchema,
   StyleRuleSchema,
   classKindSelector,
   classifySelectorCreateInput,
@@ -51,6 +52,7 @@ export type {
   SelectorCreateInput,
   StyleRule,
   StyleRuleKind,
+  StyleRuleOrigin,
 } from './styleRule'
 export type { Condition, ConditionDef } from './condition'
 export type { SiteSettings } from './siteSettings'
@@ -67,7 +69,7 @@ export type {
 
 // Defaults
 export { DEFAULT_BREAKPOINTS, breakpointMediaQuery, defaultBreakpointMediaQuery } from './breakpoint'
-export { DEFAULT_SITE_SETTINGS } from './siteSettings'
+export { DEFAULT_SITE_SETTINGS, createNewSiteSettings } from './siteSettings'
 
 // Condition helpers
 export { conditionId, conditionLabel, makeConditionDef, parseConditions } from './condition'

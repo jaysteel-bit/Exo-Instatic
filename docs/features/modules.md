@@ -46,15 +46,15 @@ src/modules/base/
 ├── video/               — base.video (youtube.ts — ID parse + embed URL leaf)
 ├── list/                — base.list (items.ts — textarea item-splitting leaf)
 ├── loop/                — base.loop
-├── forms/               — base.form and form-control primitives
+├── forms/               — base.form and form-control primitives (content.ts: submit children/label rule)
 ├── visualComponentRef/  — base.visual-component-ref
 ├── slotOutlet/          — base.slot-outlet (VC author side)
 ├── slotInstance/        — base.slot-instance (VC consumer side)
 ├── shared/
-│   └── anchorTarget.ts  — AnchorTargetSchema, ANCHOR_TARGET_OPTIONS, anchorRel() (button + link)
+│   └── anchorTarget.ts  — ANCHOR_TARGET_OPTIONS, anchorRel(), mergeAnchorRel(), anchorHtmlAttributes() (button + link; schema in @core/htmlAttributes)
 ├── utils/
 │   ├── escape.ts        — escapeHtml, safeUrl, sanitiseCssValue, buildStyle (re-exports publisher utils)
-│   ├── htmlTag.ts       — resolveHtmlTag, htmlTagControl, customHtmlTagControl, VOID_HTML_ELEMENTS
+│   ├── htmlTag.ts       — htmlTagControl, customHtmlTagControl (resolution lives in @core/htmlAttributes)
 │   └── mediaAttrs.ts    — buildMediaSrcset, pickMediaVariantUrl
 └── index.ts             — side-effect imports; each module self-registers on load
 ```
@@ -495,7 +495,8 @@ At render time, `resolveDynamicProps(...)` substitutes the bound value. Used ins
   - `src/core/module-engine/dependencies.ts` — `ModuleDependencies`, `getMissingModuleDependencies`
   - `src/modules/base/index.ts` — boot-time first-party registration
   - `src/modules/base/utils/escape.ts` — `escapeHtml`, `safeUrl`, `buildStyle`
-  - `src/modules/base/utils/htmlTag.ts` — `resolveHtmlTag`, `htmlTagControl`, `VOID_HTML_ELEMENTS`
+  - `src/core/htmlAttributes/tags.ts` — `resolveHtmlTag`, `BUILTIN_HTML_TAGS`, `VOID_HTML_ELEMENTS`
+  - `src/modules/base/utils/htmlTag.ts` — `htmlTagControl`, `customHtmlTagControl`
   - `src/modules/base/utils/mediaAttrs.ts` — `buildMediaSrcset`, `pickMediaVariantUrl`
 - Gate tests:
   - `src/__tests__/architecture/component-system-placement.test.ts`

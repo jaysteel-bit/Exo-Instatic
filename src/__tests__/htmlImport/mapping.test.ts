@@ -200,6 +200,38 @@ describe('base.link — plain <a> elements', () => {
     expect(node.props.target).toBe('_self')
   })
 
+  it('plain anchor with target="" → "_self", href and text kept', () => {
+    const node = single('<a href="/contact/" target="">Contact us</a>')
+    expect(node.props.target).toBe('_self')
+    expect(node.props.href).toBe('/contact/')
+    expect(node.props.text).toBe('Contact us')
+  })
+
+  it('plain anchor with a bare target attribute → "_self"', () => {
+    const node = single('<a href="/contact/" target>Contact us</a>')
+    expect(node.props.target).toBe('_self')
+  })
+
+  it('plain anchor with target="_top" → "_self"', () => {
+    const node = single('<a href="/" target="_top">Home</a>')
+    expect(node.props.target).toBe('_self')
+  })
+
+  it('plain anchor with a named target → "_blank" (a new tab when no frame has that name)', () => {
+    const node = single('<a href="/" target="content-frame">Home</a>')
+    expect(node.props.target).toBe('_blank')
+  })
+
+  it('plain anchor keeps target="_parent"', () => {
+    const node = single('<a href="/" target="_parent">Up</a>')
+    expect(node.props.target).toBe('_parent')
+  })
+
+  it('plain anchor reads target keywords case-insensitively', () => {
+    const node = single('<a href="/" target="_BLANK">Open</a>')
+    expect(node.props.target).toBe('_blank')
+  })
+
   it('plain anchor with empty href → href is empty string', () => {
     const node = single('<a href="">Empty</a>')
     expect(node.props.href).toBe('')
@@ -239,6 +271,24 @@ describe('base.button — <a class="btn"> elements', () => {
     expect(node.props.target).toBe('_self')
   })
 
+  it('<a class="btn"> with target="" → "_self", href and label kept', () => {
+    const node = single('<a class="btn" href="/buy" target="">Buy now</a>')
+    expect(node.props.target).toBe('_self')
+    expect(node.props.href).toBe('/buy')
+    expect(node.props.label).toBe('Buy now')
+  })
+
+  it('<a class="btn"> with target="_top" → "_self", a named target → "_blank"', () => {
+    expect(single('<a class="btn" href="/x" target="_top">X</a>').props.target).toBe('_self')
+    expect(single('<a class="btn" href="/x" target="_new">X</a>').props.target).toBe('_blank')
+  })
+
+  it('compound <a class="btn"> (→ base.link) normalises target too', () => {
+    const node = single('<a class="btn" href="/x" target=""><span>X</span></a>')
+    expect(node.moduleId).toBe('base.link')
+    expect(node.props.target).toBe('_self')
+  })
+
   it('<a class="btn primary"> — btn is present among other classes → still base.button', () => {
     const node = single('<a class="btn primary large" href="/x">CTA</a>')
     expect(node.moduleId).toBe('base.button')
@@ -246,7 +296,7 @@ describe('base.button — <a class="btn"> elements', () => {
 })
 
 // ---------------------------------------------------------------------------
-// 3. <img> → base.image (src only, NO alt prop)
+// 3. <img> → base.image (src + perf hints; alt travels to the media record)
 // ---------------------------------------------------------------------------
 
 describe('base.image — <img> elements', () => {
@@ -260,12 +310,50 @@ describe('base.image — <img> elements', () => {
     expect(node.props.src).toBe('/photo.jpg')
   })
 
-  it('<img src alt> — alt is NOT stored as a prop (alt comes from the media library)', () => {
-    const node = single('<img src="/photo.jpg" alt="A beautiful photo">')
+  it('<img src alt> — alt is NOT a prop; it is reported through imageAlts for the media record', () => {
+    const result = imported('<img src="/photo.jpg" alt="A beautiful photo">')
+    const node = result.nodes[result.rootIds[0]!]!
     expect(node.moduleId).toBe('base.image')
     expect(node.props.src).toBe('/photo.jpg')
-    // alt must NOT be on the node — it comes from the media library asset only
+    // alt is not per-instance — the Media Library asset is the source of truth.
     expect('alt' in node.props).toBe(false)
+    expect(result.imageAlts).toEqual({ [node.id]: 'A beautiful photo' })
+  })
+
+  it('an intentionally empty alt (decorative image) is reported as empty, not dropped', () => {
+    const result = imported('<img src="/deco.png" alt="">')
+    expect(result.imageAlts[result.rootIds[0]!]).toBe('')
+  })
+
+  it('an <img> without alt reports nothing, so the media record keeps its own alt', () => {
+    const result = imported('<img src="/photo.jpg">')
+    expect(result.imageAlts).toEqual({})
+  })
+
+  it('maps authored loading, decoding and fetchpriority onto the first-class Image props', () => {
+    const props = singleProps('<img src="/hero.jpg" loading="eager" decoding="sync" fetchpriority="high">')
+    expect(props.loading).toBe('eager')
+    expect(props.decoding).toBe('sync')
+    expect(props.fetchPriority).toBe('high')
+  })
+
+  it('reads the perf hints case-insensitively', () => {
+    const props = singleProps('<img src="/hero.jpg" loading="EAGER" decoding="Auto" fetchpriority="Low">')
+    expect(props.loading).toBe('eager')
+    expect(props.decoding).toBe('auto')
+    expect(props.fetchPriority).toBe('low')
+  })
+
+  it('unknown loading / decoding / fetchpriority values fall back to the module defaults', () => {
+    const props = singleProps('<img src="/a.png" loading="soon" decoding="fast" fetchpriority="urgent">')
+    expect(props.loading).toBe('lazy')
+    expect(props.decoding).toBe('async')
+    expect(props.fetchPriority).toBe('auto')
+  })
+
+  it('keeps generated attributes out of htmlAttributes while preserving the rest', () => {
+    const props = singleProps('<img src="/a.png" alt="x" loading="eager" width="10" height="10" data-track="hero">')
+    expect(props.htmlAttributes).toEqual({ 'data-track': 'hero' })
   })
 
   it('<img> with empty src → src is empty string', () => {
@@ -792,6 +880,33 @@ describe('collectStyleCss — <style> elements', () => {
     const result = imported('<p>No styles here</p>')
     expect(result.styleCss).toBe('')
   })
+
+  // A browser parses each <style> element as its own stylesheet, so one
+  // block's unclosed @media cannot capture the next block. The concatenated
+  // styleCss has to keep that boundary or a theme customizer block missing a
+  // single `}` would demote every later block to its media context.
+  it('closes an unclosed @media in one <style> block before the next block is appended', () => {
+    const result = imported(
+      '<style>.nav a{color:#fff}@media only screen and (max-width:600px){.nav{display:none}</style>'
+      + '<style>.nav a{color:#1e1e1e}</style><p>Text</p>',
+    )
+    const blocks = result.styleCss.split('\n')
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0]!.endsWith('}}')).toBe(true)
+    expect(blocks[1]).toBe('.nav a{color:#1e1e1e}')
+  })
+
+  it('closes an unterminated comment or string so the next block stays live CSS', () => {
+    expect(imported('<style>.a{color:red}/* open</style><style>.b{color:blue}</style>').styleCss)
+      .toBe('.a{color:red}/* open*/\n.b{color:blue}')
+    expect(imported('<style>.a{content:"x</style><style>.b{color:blue}</style>').styleCss)
+      .toBe('.a{content:"x"}\n.b{color:blue}')
+  })
+
+  it('leaves balanced blocks untouched, braces inside comments and strings ignored', () => {
+    const css = '.a{content:"{"}/* { */.b{color:blue}'
+    expect(imported(`<style>${css}</style>`).styleCss).toBe(css)
+  })
 })
 
 describe('stripUnsafe — inline event handlers (on*)', () => {
@@ -994,9 +1109,29 @@ describe('HTML attribute preservation — props.htmlAttributes for ordinary base
 
     const children = container.children.map((id) => result.nodes[id]!)
     expect(children[0]!.moduleId).toBe('base.link')
-    expect(children[0]!.props.htmlAttributes).toEqual({ 'data-track': 'jump' })
+    expect(children[0]!.props.htmlAttributes).toEqual({ rel: 'nofollow', 'data-track': 'jump' })
     expect(children[1]!.moduleId).toBe('base.image')
     expect(children[1]!.props.htmlAttributes).toEqual({ 'data-lazy': 'logo' })
+  })
+
+  it('keeps an authored rel on links and button anchors', () => {
+    // The modules regenerate only the security rel for target="_blank", so a
+    // source rel (nofollow, next/prev, sponsored) has no other home. A theme
+    // styling `a[rel="next"]` needs it to survive import.
+    const result = imported(`
+      <nav>
+        <a href="/page/2/" rel="next">Next</a>
+        <a class="btn" href="https://sponsor.example" target="_blank" rel="sponsored nofollow">Sponsor</a>
+      </nav>
+    `)
+
+    const nav = result.nodes[result.rootIds[0]!]!
+    const children = nav.children.map((id) => result.nodes[id]!)
+    expect(children[0]!.moduleId).toBe('base.link')
+    expect(children[0]!.props.htmlAttributes).toEqual({ rel: 'next' })
+    expect(children[1]!.moduleId).toBe('base.button')
+    expect(children[1]!.props.target).toBe('_blank')
+    expect(children[1]!.props.htmlAttributes).toEqual({ rel: 'sponsored nofollow' })
   })
 })
 
@@ -1469,5 +1604,15 @@ describe('edge cases', () => {
     expect(result.stripped.scripts).toBe(0)
     expect(result.stripped.inlineHandlers).toBe(0)
     expect(result.styleCss).toBe('')
+  })
+})
+
+
+describe('collectStyleCss — trailing string escape', () => {
+  it('keeps the next stylesheet outside a string ending with a backslash', () => {
+    const result = imported('<style>.a{content:"x\\</style><style>.b{color:blue}</style>')
+    // Without the escaped newline, the appended quote is itself escaped;
+    // Chromium consumes the following .b rule as part of .a.
+    expect(result.styleCss).toBe('.a{content:"x\\\n"}\n.b{color:blue}')
   })
 })
