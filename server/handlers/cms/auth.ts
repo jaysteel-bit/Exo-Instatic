@@ -295,7 +295,7 @@ async function respondLoginFailure(
  * carries `mfaRequired: true` — the client then follows up with
  * `POST /auth/mfa/verify`. Without MFA the session is immediately valid.
  */
-async function respondLoginSuccess(
+export async function respondLoginSuccess(
   db: DbClient,
   req: Request,
   user: AuthUser,

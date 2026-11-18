@@ -25,6 +25,7 @@ import { jsonResponse } from './http'
 import { tryServeManager } from './manager/handler'
 import { binaryResponse, toArrayBuffer } from './binary'
 import { hardenUploadResponse, serveAdminApp, serveStaticFile } from './static'
+import { tryServeFlowOsClerk } from './flowOsClerk'
 import { registry } from '@core/module-engine'
 import type { CssBundleFile, SiteCssBundleId } from '@core/publisher'
 import { buildPublishedSiteCssBundle } from './publish/siteCssBundle'
@@ -61,6 +62,8 @@ const routes: readonly RouteHandler[] = [
   // `/admin/api/agent/tool-result` were deleted in Phase 3 of the AI
   // runtime rewrite. The site editor now POSTs `/admin/api/ai/chat/site`.
   tryServeAi,
+  // Exo: Flow OS signs in to the CMS with its Clerk session (server/flowOsClerk.ts).
+  (req, runtime, _url, pathname) => tryServeFlowOsClerk(req, runtime.db, pathname),
   tryServeCmsApi,
   // Branch preview links — `/_instatic/preview/<token>` sets the preview
   // cookie, `/_instatic/preview/exit` clears it. Public GETs below then
