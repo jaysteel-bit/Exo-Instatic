@@ -1,0 +1,137 @@
+# Exo: keep Launch CMS (this fork) current with CoreBunch/Instatic.
+#
+# Every 3 days (and on demand) this merges upstream main into a branch, runs
+# the typecheck/build and the unit tests, and opens a pull request with the
+# results. It never merges into main by itself: an upstream release can carry
+# database migrations, and main is what the live CMS runs, so a person or an
+# agent reviews and merges. A merge conflict with our Exo changes opens an
+# issue instead.
+#
+# A PR opened with GITHUB_TOKEN does not trigger the other workflows (CI,
+# e2e), which is why the checks run here.
+
+name: Exo upstream sync
+
+on:
+  schedule:
+    - cron: "17 9 */3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: exo-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'jaysteel-bit/Exo-Instatic'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: upstream
+        run: |
+          git remote add upstream https://github.com/CoreBunch/Instatic.git
+          git fetch --no-tags upstream main
+          echo "behind=$(git rev-list --count HEAD..upstream/main)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Already proposed?
+        id: existing
+        if: steps.upstream.outputs.behind != '0'
+        run: |
+          branch="upstream-sync/${{ steps.upstream.outputs.sha }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "A sync branch for upstream ${{ steps.upstream.outputs.sha }} already exists."
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.upstream.outputs.behind != '0' && steps.existing.outputs.skip != 'true'
+        run: |
+          git config user.name "exo-upstream-sync"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${{ steps.existing.outputs.branch }}"
+          if git merge --no-ff --no-edit upstream/main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > conflicts.txt
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Bun
+        if: steps.merge.outputs.conflict == 'false'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install, build, test
+        id: checks
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          set +e
+          bun install --frozen-lockfile > install.log 2>&1; install=$?
+          bun run build > build.log 2>&1; build=$?
+          bun test > test.log 2>&1; test=$?
+          echo "install=$install" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "test=$test" >> "$GITHUB_OUTPUT"
+          grep -E "^ *[0-9]+ (pass|fail|skip)|^Ran " test.log > summary.txt || echo "(no test summary)" > summary.txt
+          grep "^(fail)" test.log | head -40 > failures.txt || true
+
+      - name: Open pull request
+        if: steps.merge.outputs.conflict == 'false'
+        run: |
+          git push origin "${{ steps.existing.outputs.branch }}"
+          mark() { [ "$1" = "0" ] && echo "pass" || echo "FAIL (exit $1)"; }
+          fence='```'
+          {
+            echo "Upstream \`CoreBunch/Instatic\` main is ${{ steps.upstream.outputs.behind }} commit(s) ahead of our \`main\` (upstream \`${{ steps.upstream.outputs.sha }}\`). This branch merges it; our Exo commits are kept."
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| \`bun install --frozen-lockfile\` | $(mark ${{ steps.checks.outputs.install }}) |"
+            echo "| \`bun run build\` (tsc + vite) | $(mark ${{ steps.checks.outputs.build }}) |"
+            echo "| \`bun test\` | $(mark ${{ steps.checks.outputs.test }}) |"
+            echo
+            echo "Test summary:"
+            echo "$fence"; cat summary.txt; echo "$fence"
+            if [ -s failures.txt ]; then
+              echo "Failures (compare with upstream before merging):"
+              echo "$fence"; cat failures.txt; echo "$fence"
+            fi
+            echo
+            echo "Before merging: read upstream's CHANGELOG for migrations and new env vars, and back up the live CMS database. Opened by \`.github/workflows/exo-upstream-sync.yml\`."
+          } > body.md
+          # One open sync PR at a time: close the ones this supersedes.
+          for n in $(gh pr list --state open --json number,headRefName --jq '.[] | select(.headRefName | startswith("upstream-sync/")) | .number'); do
+            gh pr close "$n" --comment "Superseded by the sync for upstream ${{ steps.upstream.outputs.sha }}." --delete-branch
+          done
+          gh pr create --base main --head "${{ steps.existing.outputs.branch }}" \
+            --title "Upstream sync: Instatic ${{ steps.upstream.outputs.sha }} (${{ steps.upstream.outputs.behind }} commits)" \
+            --body-file body.md
+
+      - name: Report a conflict
+        if: steps.merge.outputs.conflict == 'true'
+        run: |
+          {
+            echo "Merging upstream \`CoreBunch/Instatic\` main (\`${{ steps.upstream.outputs.sha }}\`) into our \`main\` conflicts in:"
+            echo
+            sed 's/^/- `/; s/$/`/' conflicts.txt
+            echo
+            echo "Resolve by hand (or ask an agent): merge \`upstream/main\` locally, keep the Exo changes, run \`bun run build\` and \`bun test\`, push."
+          } > issue.md
+          gh issue create --title "Upstream sync conflict: Instatic ${{ steps.upstream.outputs.sha }}" --body-file issue.md
